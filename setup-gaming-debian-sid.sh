@@ -133,7 +133,7 @@ flatpak_installed() {
 # adelante; este chequeo avisa la causa real por adelantado, en vez de
 # dejar que el síntoma aparezca disfrazado como "no se detectó NVML".
 check_system_prerequisites() {
-    log_step "0/10 · Comprobando prerrequisitos del sistema"
+    log_step "0/11 · Comprobando prerrequisitos del sistema"
 
     local sources_file="/etc/apt/sources.list.d/debian.sources"
 
@@ -172,7 +172,7 @@ _confirm_or_exit_no_sid() {
 # 1. Steam (.deb oficial de Valve)
 # ---------------------------------------------------------------------------
 step_steam() {
-    log_step "1/10 · Instalando Steam (.deb oficial de Valve)"
+    log_step "1/11 · Instalando Steam (.deb oficial de Valve)"
 
     if pkg_installed steam-launcher || pkg_installed steam-installer; then
         log_ok "Steam ya estaba instalado"
@@ -208,7 +208,7 @@ step_steam() {
 # 2. Flatpak + Flathub (por si el proyecto base todavía no lo dejó listo)
 # ---------------------------------------------------------------------------
 step_ensure_flatpak() {
-    log_step "2/10 · Instalando/actualizando Flatpak y Flathub"
+    log_step "2/11 · Instalando/actualizando Flatpak y Flathub"
 
     # Sin pre-chequeo 'pkg_installed': 'apt install' sobre un paquete ya
     # instalado es idempotente (no hace nada si ya está en la última
@@ -233,7 +233,7 @@ step_ensure_flatpak() {
 # 3. ProtonPlus (Flatpak — es el método principal recomendado por el propio proyecto)
 # ---------------------------------------------------------------------------
 step_protonplus() {
-    log_step "3/10 · Instalando/actualizando ProtonPlus (Flatpak)"
+    log_step "3/11 · Instalando/actualizando ProtonPlus (Flatpak)"
 
     if flatpak_installed com.vysp3r.ProtonPlus; then
         # Ya instalado: 'flatpak update' es el comando correcto para
@@ -259,7 +259,7 @@ step_protonplus() {
 # 4. Heroic Games Launcher (.deb oficial, auto-actualizado desde GitHub)
 # ---------------------------------------------------------------------------
 step_heroic_launcher() {
-    log_step "4/10 · Descargando e instalando/actualizando Heroic Games Launcher"
+    log_step "4/11 · Descargando e instalando/actualizando Heroic Games Launcher"
 
     local api_url="https://api.github.com/repos/Heroic-Games-Launcher/HeroicGamesLauncher/releases/latest"
     local deb_url
@@ -569,7 +569,7 @@ step_mangohud_compile_nvml() {
 }
 
 step_gamemode_mangohud() {
-    log_step "5/10 · Instalando GameMode, MangoHud (compilado con NVML) y MangoJuice (Flatpak)"
+    log_step "5/11 · Instalando GameMode, MangoHud (compilado con NVML) y MangoJuice (Flatpak)"
 
     if sudo apt install -y gamemode; then
         log_ok "GameMode instalado/actualizado (vía apt)"
@@ -599,9 +599,99 @@ step_gamemode_mangohud() {
 }
 
 # ---------------------------------------------------------------------------
-# 6. Configurar pci_dev de la GPU NVIDIA en MangoHud.conf (equipos con
-#    gráfica híbrida: NVIDIA dedicada + integrada Intel/AMD)
+# 6. Valores por defecto de ~/.config/gamemode.ini (solo si no existe)
 # ---------------------------------------------------------------------------
+#
+# IMPORTANTE -- por qué "solo si no existe" y no "siempre pisar con estos
+# valores": este archivo es una preferencia personal, no algo con un valor
+# correcto universal (ver el aviso largo en step_install_game_performance
+# sobre por qué "más forzado" no siempre es mejor -- se midió un caso real
+# donde SÍ lo era y otro donde NO). Si el script lo pisara en cada corrida,
+# cualquier ajuste que hagas a mano después de medir con MangoHud se
+# perdería la próxima vez que corras el script -- rompería exactamente el
+# tipo de idempotencia que le sirve al usuario (no reinstala lo que ya
+# está en su última versión), reemplazándola por una que le sirve al
+# script (siempre el mismo resultado, ignorando tus cambios).
+#
+# Por qué se detecta el gobernador en vez de hardcodear "schedutil":
+# probado en la práctica el 17/09/2026 en un Ryzen 7 6800HS con driver
+# amd_pstate-epp (modo activo, el default en kernels modernos para CPUs
+# AMD recientes) -- ese driver expone ÚNICAMENTE "performance" y
+# "powersave" como gobernadores válidos; "schedutil" no existe ahí, y
+# gamemoded -t fallaba con "Governor was not set to schedutil (was
+# actually powersave)!". No es un error real: bajo amd_pstate en modo
+# activo, "powersave" ya es dinámico (el kernel lo traduce a un hint EPP
+# y escala en base a carga real, funcionalmente equivalente a schedutil
+# en un driver cpufreq clásico) -- pero pedirle al daemon un gobernador
+# que no existe en la lista disponible sigue siendo un error evitable.
+# Por eso, en vez de asumir "schedutil" siempre, se lee
+# scaling_available_governors y se elige: schedutil si está en la lista
+# (drivers cpufreq clásicos, ej. acpi-cpufreq, amd_pstate en modo
+# passive/guided), si no, powersave (amd_pstate/intel_pstate en modo
+# activo, donde powersave YA es la opción dinámica).
+#
+# Por qué NO se incluye desiredprof: es un bug conocido y abierto en
+# GameMode mismo (no del paquete de Debian, no de este equipo) -- se
+# ignora silenciosamente incluso usando el gamemode.ini de ejemplo
+# oficial del proyecto (FeralInteractive/gamemode issue #539, reproducido
+# en GameMode 1.8.2). Incluirlo no rompe nada, pero tampoco hace nada más
+# que ensuciar el log con "Config: Value ignored" -- se omite hasta que
+# se resuelva río arriba.
+_gamemode_pick_governor() {
+    local available="" gov_file
+    gov_file="/sys/devices/system/cpu/cpu0/cpufreq/scaling_available_governors"
+
+    if [[ -r "$gov_file" ]]; then
+        available="$(cat "$gov_file" 2>/dev/null)"
+    fi
+
+    if grep -qw 'schedutil' <<<"$available"; then
+        echo "schedutil"
+    elif grep -qw 'powersave' <<<"$available"; then
+        echo "powersave"
+    else
+        # No se pudo leer la lista (poco común) -- powersave existe en
+        # prácticamente cualquier driver cpufreq de Linux, es la opción
+        # más segura como último recurso.
+        echo "powersave"
+    fi
+}
+
+step_gamemode_ini_defaults() {
+    log_step "6/11 · Configurando valores por defecto de ~/.config/gamemode.ini"
+
+    local gamemode_ini="${HOME}/.config/gamemode.ini"
+    local marker="# gamemode.ini -- configurado por setup-gaming-debian-sid.sh"
+
+    if [[ -f "$gamemode_ini" ]] && grep -qF "$marker" "$gamemode_ini" 2>/dev/null; then
+        log_ok "${gamemode_ini} ya estaba configurado por este script, no se toca"
+        return
+    fi
+
+    if [[ -f "$gamemode_ini" ]]; then
+        log_warn "${gamemode_ini} ya existe pero no lo generó este script (no tiene el marcador esperado). Se deja intacto para no pisar tu configuración; revisalo a mano si querés aplicar un gobernador dinámico vos mismo."
+        return
+    fi
+
+    local governor
+    governor="$(_gamemode_pick_governor)"
+
+    mkdir -p "${HOME}/.config"
+    cat > "$gamemode_ini" <<GAMEMODE_INI_EOF
+${marker}
+[general]
+; El kernel decide la frecuencia de CPU según la carga real, en vez de
+; que GameMode fuerce un estado fijo mientras el juego está abierto.
+; Gobernador elegido automáticamente según lo que ofrece TU driver
+; cpufreq (ver scaling_available_governors) -- no es una regla
+; universal, mide con MangoHud si te conviene en tu equipo; si ya lo
+; tenías puesto en otro valor por algo, no lo pisamos.
+desiredgov=${governor}
+GAMEMODE_INI_EOF
+
+    log_ok "${gamemode_ini} creado con valores por defecto (desiredgov=${governor}, detectado según tu driver cpufreq)"
+}
+
 
 # En portátiles con GPU híbrida, MangoHud (incluso con NVML) puede fallar
 # al leer el % de uso de GPU si no sabe a qué GPU consultar vía NVML.
@@ -610,7 +700,7 @@ step_gamemode_mangohud() {
 # selecciona por índice DRM, no por PCI), puede pisar el filtrado y
 # volver a leer la GPU equivocada.
 step_mangohud_pci_dev() {
-    log_step "6/10 · Configurando pci_dev de la GPU NVIDIA en MangoHud.conf"
+    log_step "7/11 · Configurando pci_dev de la GPU NVIDIA en MangoHud.conf"
 
     if ! command -v nvidia-smi &>/dev/null; then
         log_info "No se detectó 'nvidia-smi'; se omite (no hay GPU NVIDIA o falta el driver)"
@@ -655,7 +745,7 @@ step_mangohud_pci_dev() {
 # No forman parte del setup de gaming en sí; sirven para probar drivers,
 # MangoHud, etc. sin depender de abrir un juego completo.
 step_diagnostic_tools() {
-    log_step "7/10 · Instalando/actualizando herramientas de diagnóstico (mesa-utils)"
+    log_step "8/11 · Instalando/actualizando herramientas de diagnóstico (mesa-utils)"
 
     if sudo apt install -y mesa-utils; then
         log_ok "mesa-utils instalado/actualizado (glxgears, glxinfo — útiles para probar drivers/MangoHud rápido)"
@@ -668,7 +758,7 @@ step_diagnostic_tools() {
 # 8. vm.max_map_count elevado (recomendado por varios juegos/motores modernos)
 # ---------------------------------------------------------------------------
 step_max_map_count() {
-    log_step "8/10 · Ajustando vm.max_map_count"
+    log_step "9/11 · Ajustando vm.max_map_count"
 
     local sysctl_file="/etc/sysctl.d/80-gamecompatibility.conf"
     if [[ -f "$sysctl_file" ]] && grep -q '^vm.max_map_count=2147483642' "$sysctl_file"; then
@@ -684,7 +774,7 @@ step_max_map_count() {
 # 9. Verificar/activar ntsync
 # ---------------------------------------------------------------------------
 step_ntsync() {
-    log_step "9/10 · Verificando soporte de ntsync"
+    log_step "10/11 · Verificando soporte de ntsync"
 
     local modules_file="/etc/modules-load.d/ntsync.conf"
 
@@ -752,9 +842,22 @@ step_ntsync() {
 # GameMode (gamemoderun, ya usado en este script) sigue siendo complementario,
 # no redundante: aporta prioridad de proceso, posible ajuste de GPU, y el
 # indicador que MangoHud muestra en el overlay -- cosas que game-performance
-# no cubre. Se recomiendan usar juntos: ver el resumen final.
+# no cubre.
+#
+# IMPORTANTE -- esto NO es "usalo siempre" ni "no lo uses nunca": es
+# específico de cada equipo, no hay una regla universal correcta. En un
+# ASUS ROG (Ryzen 7 6800HS + RTX 3050 laptop) se midió, con MangoHud, que
+# para un juego dado forzar 'performance' con game-performance daba la
+# MISMA cantidad de FPS que dejarlo en 'balanced', pero con la CPU 27°C
+# más caliente (84°C vs 57°C) -- ahí forzar 'performance' no aportaba
+# nada y solo generaba más calor y ruido de ventilador. En otro equipo
+# (desktop con disipación de CPU y GPU separada, u otro laptop con mejor
+# cooling) el resultado bien podría ser el opuesto, o no notarse
+# diferencia alguna. No asumas ninguno de los dos casos: medilo vos con
+# el overlay de MangoHud, juego por juego, ver el resumen final para el
+# método.
 step_install_game_performance() {
-    log_step "10/10 · Instalando wrapper game-performance"
+    log_step "11/11 · Instalando wrapper game-performance"
 
     if ! pkg_installed power-profiles-daemon; then
         sudo apt install -y power-profiles-daemon
@@ -856,15 +959,20 @@ step_summary() {
     echo "  - En Steam: Configuración → Compatibilidad → activá 'Habilitar Steam Play"
     echo "    para todos los demás títulos' y elegí la versión de Proton (o una de"
     echo "    ProtonPlus) que quieras usar por defecto."
-    echo "  - En las opciones de lanzamiento de cada juego, usá game-performance"
-    echo "    JUNTO con gamemoderun (no en vez de), así:"
+    echo "  - Empezá cada juego SIN game-performance, solo con:"
+    echo "      gamemoderun mangohud %command%"
+    echo "    y mirá el overlay de MangoHud (% de uso y temperatura de CPU/GPU)."
+    echo "    Si los FPS te alcanzan y no ves stuttering, dejalo así -- forzar más"
+    echo "    no te da nada a cambio, solo calor y ruido de ventilador de más."
+    echo "    Si notás FPS bajos o caídas puntuales, sumá game-performance:"
     echo "      game-performance gamemoderun mangohud %command%"
     echo "    game-performance cambia el perfil de energía a 'performance' mientras"
     echo "    el juego corre (en este equipo eso sincroniza a la vez gobernador de"
     echo "    CPU, EPP, y la curva de ventiladores de asusctl -- confirmado en la"
     echo "    práctica) y restaura el perfil anterior al cerrar el juego."
-    echo "    GameMode sigue siendo complementario: aporta prioridad de proceso,"
-    echo "    posible ajuste de GPU, y el indicador que ves en el overlay de MangoHud."
+    echo "    Esto es por-juego, no una regla fija: en este mismo equipo se midió"
+    echo "    un caso con los mismos FPS pero 27°C más de CPU al forzarlo, así que"
+    echo "    no asumas que 'más forzado' es siempre mejor -- medí con MangoHud."
     echo "    Fuera de Steam (terminal, Heroic, Lutris) podés usar game-performance"
     echo "    igual: 'game-performance <comando>'."
     echo "  - Si tenés GPU NVIDIA dedicada, el script ya configuró 'pci_dev' en"
@@ -872,6 +980,14 @@ step_summary() {
     echo "    En equipos con GPU híbrida, si MangoJuice agrega 'gpu_list=' puede pisar"
     echo "    ese filtrado y volver a mostrar el % de GPU equivocado: comentá o borrá"
     echo "    esa línea si eso pasa."
+    echo "  - ~/.config/gamemode.ini quedó creado (solo si no existía ya) con"
+    echo "    desiredgov detectado automáticamente según tu driver cpufreq (schedutil"
+    echo "    si está disponible, powersave si no -- en amd_pstate/intel_pstate en"
+    echo "    modo activo, powersave YA es dinámico, no es el modo fijo-bajo de antes)."
+    echo "    Así el CPU sube/baja de frecuencia según la carga real, en vez de"
+    echo "    quedarse arriba fijo todo el tiempo que el juego está abierto. Si ya lo"
+    echo "    tenías configurado a tu manera, el script no lo tocó. Corré"
+    echo "    'gamemoded -t' para confirmar qué gobernador detectó y aplicó."
     echo "  - mesa-utils quedó instalado (glxgears, glxinfo) solo como herramienta de"
     echo "    diagnóstico rápido, para probar drivers/MangoHud sin abrir un juego."
     echo "  - Si acabás de habilitar ntsync, puede que necesites reiniciar para que"
@@ -893,6 +1009,7 @@ main() {
     step_protonplus
     step_heroic_launcher
     step_gamemode_mangohud
+    step_gamemode_ini_defaults
     step_mangohud_pci_dev
     step_diagnostic_tools
     step_max_map_count
