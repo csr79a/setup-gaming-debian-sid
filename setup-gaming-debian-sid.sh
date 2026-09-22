@@ -5,10 +5,13 @@
 # Instala y optimiza Debian Sid (Unstable) / KDE Plasma para jugar: Steam,
 # ProtonPlus (gestor de builds de Proton-GE), Heroic Games Launcher (con
 # auto-actualización), GameMode, MangoHud (compilado desde fuente con
-# soporte NVML para GPUs NVIDIA) + MangoJuice como GUI de configuración,
-# configuración automática de pci_dev en MangoHud.conf para GPUs híbridas,
-# herramientas de diagnóstico (mesa-utils) y algunos ajustes del sistema
-# recomendados para juegos modernos.
+# soporte NVML para GPUs NVIDIA) + MangoJuice como GUI de configuración
+# (Flatpak, opcional: se pregunta), Winetricks y Protontricks (paquetes nativos de Debian) para
+# aplicar workarounds de Wine a juegos vía Proton, configuración automática
+# de pci_dev en MangoHud.conf para GPUs híbridas, herramientas de
+# diagnóstico (mesa-utils) y algunos ajustes del sistema recomendados para
+# juegos modernos. Además, ntsync se carga automáticamente en cada arranque,
+# y Lutris y Gamescope se ofrecen como pasos opcionales.
 #
 # Equivalente al proyecto setup-gaming-fedora, adaptado a las herramientas
 # reales disponibles en Debian: donde el paquete de Debian está muy
@@ -20,7 +23,7 @@
 # Nota sobre MangoHud: el paquete `mangohud` de los repos de Debian es la
 # build DFSG (Debian Free Software Guidelines), compilada SIN soporte NVML
 # (la librería propietaria de NVIDIA necesaria para leer % de uso, VRAM y
-# temperatura de GPUs NVIDIA). Si tenés una GPU NVIDIA, ese paquete jamás
+# temperatura de GPUs NVIDIA). Si tienes una GPU NVIDIA, ese paquete jamás
 # va a mostrar esos datos, aunque el resto del overlay funcione. Por eso
 # este script compila MangoHud desde fuente con -Dwith_nvml=enabled.
 #
@@ -50,7 +53,7 @@ log_step()  { echo -e "\n${COLOR_BLUE}==>${COLOR_RESET} \e[1m$*${COLOR_RESET}"; 
 
 # ---------------------------------------------------------------------------
 # Limpieza centralizada de temporales (.deb descargados, build_dir de
-# MangoHud) -- registrados acá para que se borren pase lo que pase:
+# MangoHud) -- registrados aquí para que se borren pase lo que pase:
 # terminación normal, error, o Ctrl+C a mitad de la compilación. Antes,
 # la limpieza dependía de un 'rm -f/-rf' puntual en cada 'return' de cada
 # función: si el usuario interrumpía el script con Ctrl+C durante 'ninja
@@ -58,6 +61,10 @@ log_step()  { echo -e "\n${COLOR_BLUE}==>${COLOR_RESET} \e[1m$*${COLOR_RESET}"; 
 # directorios temporales (potencialmente varios cientos de MB, en el caso
 # del build_dir de MangoHud) sin borrar en /tmp.
 TMP_PATHS=()
+
+# Estado de la oferta opcional de MangoJuice, para las verificaciones finales:
+# no_ofrecido | sin_flatpak | instalado | rechazado | fallo_consulta | fallo_instalacion
+MANGOJUICE_STATE="no_ofrecido"
 register_tmp_path() { TMP_PATHS+=("$1"); }
 _cleanup_tmp_paths() {
     local p
@@ -68,14 +75,17 @@ _cleanup_tmp_paths() {
 
 require_root_privileges() {
     if [[ "${EUID}" -eq 0 ]]; then
-        log_err "No corras este script directamente como root. Ejecutalo como tu usuario normal; se te pedirá la contraseña de sudo cuando haga falta."
+        log_err "No corras este script directamente como root. Ejecútalo como tu usuario normal; se te pedirá la contraseña de sudo cuando haga falta."
         exit 1
     fi
     if ! command -v sudo &>/dev/null; then
-        log_err "No se encontró 'sudo'. Instalalo o corré este script con un método equivalente."
+        log_err "No se encontró 'sudo'. Instálalo o ejecuta este script con un método equivalente."
         exit 1
     fi
-    sudo -v
+    if ! sudo -v; then
+        log_err "No se pudieron obtener privilegios sudo."
+        exit 1
+    fi
 
     # Refresca el timestamp de sudo cada 60s mientras dure el script. Sin
     # esto, la compilación de MangoHud (que puede tardar varios minutos)
@@ -113,12 +123,19 @@ require_root_privileges() {
     trap _on_interrupt INT TERM
 }
 
+# Las comprobaciones de este script no usan "cmd | grep -q": con
+# 'set -o pipefail', si grep -q sale en cuanto encuentra la coincidencia, el
+# comando de la izquierda puede morir por SIGPIPE y toda la tubería se da por
+# fallida aunque la coincidencia exista (falso negativo, probado con lsmod).
+# En su lugar se captura primero la salida completa y se busca sobre ella.
 pkg_installed() {
-    dpkg -l "$1" 2>/dev/null | grep -q '^ii'
+    [[ "$(dpkg-query -W -f='${db:Status-Abbrev}' "$1" 2>/dev/null)" == "ii "* ]]
 }
 
 flatpak_installed() {
-    flatpak list --app --columns=application 2>/dev/null | grep -qFx "$1"
+    local apps
+    apps="$(flatpak list --app --columns=application 2>/dev/null)"
+    grep -qFx -- "$1" <<<"$apps"
 }
 
 # ---------------------------------------------------------------------------
@@ -128,37 +145,129 @@ flatpak_installed() {
 # directamente, que resuelve dependencias solo). La excepción es la
 # compilación de MangoHud (paso 5), que necesita deb-src habilitado sobre
 # un /etc/apt/sources.list.d/debian.sources en formato deb822 apuntando a
-# unstable -- lo que deja listo setup-debian-sid.sh. Si ese archivo no
-# existe o no apunta a unstable, 'apt build-dep mangohud' puede fallar más
-# adelante; este chequeo avisa la causa real por adelantado, en vez de
-# dejar que el síntoma aparezca disfrazado como "no se detectó NVML".
+# unstable -- lo que deja listo setup-debian-sid.sh.
+#
+# Igual que en setup-debian-sid.sh (1.2.0), este script SOLO trabaja con
+# Sid: se comprueban debian.sources, /etc/apt/sources.list y el resto de
+# ficheros *.sources y *.list de /etc/apt/sources.list.d que apunten a
+# Debian. Solo se aceptan las suites "unstable" y "sid"; cualquier otra
+# (forky, trixie, trixie-security, bookworm, testing, stable...) detiene el
+# script sin preguntar. No se convierte ninguna suite automáticamente.
+SOURCES_DIR="/etc/apt/sources.list.d"
+SOURCES_FILE="${SOURCES_DIR}/debian.sources"
+LEGACY_SOURCES="/etc/apt/sources.list"
+
+# Suites de un .sources (debian.sources) que no son unstable ni sid.
+_sources_file_bad_suites() {
+    awk '/^Suites:/ { for (i = 2; i <= NF; i++) if ($i != "unstable" && $i != "sid") print $i }' "$1" | sort -u
+}
+
+# Líneas activas de /etc/apt/sources.list que apuntan a un repositorio de
+# Debian con una suite distinta de unstable/sid (cdrom: se ignora).
+_legacy_bad_lines() {
+    awk '
+      /^[[:space:]]*deb(-src)?[[:space:]]/ {
+        line = $0
+        sub(/^[[:space:]]*deb(-src)?[[:space:]]+/, "", line)
+        if (line ~ /^\[/) sub(/^\[[^]]*\][[:space:]]*/, "", line)
+        split(line, f, /[[:space:]]+/)
+        if (f[1] ~ /^cdrom:/) next
+        if (tolower(f[1]) !~ /debian/) next
+        if (f[2] != "unstable" && f[2] != "sid") print $0
+      }' "$LEGACY_SOURCES"
+}
+
+# Entradas de OTROS ficheros de sources.list.d que apuntan al archivo de
+# Debian con una suite distinta de unstable/sid. Una entrada cuenta como "de
+# Debian" si su URI es de debian.org o si usa debian-archive-keyring; así no
+# se marcan repositorios de terceros (Docker, Brave...). Se ignoran las
+# entradas con "Enabled: no". Limitación: un mirror con dominio propio y sin
+# debian-archive-keyring no se reconoce como Debian.
+_other_sources_bad_entries() {
+    local f
+    for f in "$SOURCES_DIR"/*.sources "$SOURCES_DIR"/*.list; do
+        [[ -f "$f" && "$f" != "$SOURCES_FILE" ]] || continue
+        case "$f" in
+            *.sources)
+                awk -v file="$f" '
+                  function flush(   j) {
+                    if (n > 0 && enabled && isdeb)
+                      for (j = 1; j <= n; j++)
+                        if (suites[j] != "unstable" && suites[j] != "sid") print file ": Suites: " suites[j]
+                    n = 0; enabled = 1; isdeb = 0
+                  }
+                  BEGIN { enabled = 1 }
+                  /^[[:space:]]*$/ { flush(); next }
+                  /^#/ { next }
+                  /^URIs:/ { if (tolower($0) ~ /[\/.]debian\.org(\/|[[:space:]]|$)/) isdeb = 1 }
+                  /^Signed-By:/ { if ($0 ~ /debian-archive-keyring/) isdeb = 1 }
+                  /^Enabled:/ { if (tolower($2) == "no" || tolower($2) == "false") enabled = 0 }
+                  /^Suites:/ { for (k = 2; k <= NF; k++) suites[++n] = $k }
+                  END { flush() }
+                ' "$f"
+                ;;
+            *.list)
+                awk -v file="$f" '
+                  /^[[:space:]]*deb(-src)?[[:space:]]/ {
+                    line = $0; opts = ""
+                    sub(/^[[:space:]]*deb(-src)?[[:space:]]+/, "", line)
+                    if (line ~ /^\[/) { opts = line; sub(/\].*$/, "]", opts); sub(/^\[[^]]*\][[:space:]]*/, "", line) }
+                    split(line, f2, /[[:space:]]+/)
+                    if (f2[1] ~ /^cdrom:/) next
+                    isdeb = (tolower(f2[1]) ~ /[\/.]debian\.org(\/|$)/) || (opts ~ /debian-archive-keyring/)
+                    if (isdeb && f2[2] != "unstable" && f2[2] != "sid") print file ": " $0
+                  }
+                ' "$f"
+                ;;
+        esac
+    done
+}
+
+# Muestra las entradas no-Sid encontradas y detiene el script (siempre, sin
+# preguntar).
+_abort_non_sid() {
+    local title="$1" entries="$2"
+    log_warn "$title"
+    sed 's/^/      · /' <<<"$entries"
+    log_err "Este script solo trabaja con Debian Sid (unstable) y no convierte otras suites automáticamente. Corrige o desactiva esas entradas a mano (setup-debian-sid.sh repara 'unstable-updates' en debian.sources) y vuelve a ejecutar el script."
+    exit 1
+}
+
 check_system_prerequisites() {
-    log_step "0/11 · Comprobando prerrequisitos del sistema"
+    log_step "0/14 · Comprobando prerrequisitos del sistema"
 
-    local sources_file="/etc/apt/sources.list.d/debian.sources"
+    local bad
 
-    if [[ ! -f "$sources_file" ]]; then
-        log_warn "No se encontró ${sources_file} (formato deb822). Este script no requiere haber corrido setup-debian-sid.sh para la mayoría de los pasos (apt resuelve dependencias solo), pero SIN este archivo la compilación de MangoHud con soporte NVML (paso 5) puede fallar por falta de deb-src."
-        _confirm_or_exit_no_sid
-        return
+    if [[ -f "$SOURCES_FILE" ]]; then
+        if [[ -z "$(awk '/^Suites:/ { print $2 }' "$SOURCES_FILE")" ]]; then
+            log_err "No se encontró ninguna línea 'Suites:' en ${SOURCES_FILE}, así que no se puede comprobar que los repositorios apunten a unstable/sid. Revisa el fichero y vuelve a ejecutar el script."
+            exit 1
+        fi
+        bad="$(_sources_file_bad_suites "$SOURCES_FILE")"
+        [[ -n "$bad" ]] && _abort_non_sid "${SOURCES_FILE} contiene suites que no son unstable/sid:" "$bad"
     fi
 
-    if ! grep -qE '^Suites:.*(unstable|testing)' "$sources_file"; then
-        log_warn "${sources_file} existe pero no parece apuntar a 'unstable' ni 'testing'. Este script está pensado para Debian Sid (y probablemente ande bien en testing/trixie); en Debian estable, la compilación de MangoHud (librerías más viejas) y ntsync (kernel viejo) pueden fallar."
-        _confirm_or_exit_no_sid
+    if [[ -f "$LEGACY_SOURCES" ]]; then
+        bad="$(_legacy_bad_lines)"
+        [[ -n "$bad" ]] && _abort_non_sid "${LEGACY_SOURCES} contiene repositorios activos de Debian que no apuntan a unstable/sid:" "$bad"
+    fi
+
+    bad="$(_other_sources_bad_entries)"
+    [[ -n "$bad" ]] && _abort_non_sid "Hay otros ficheros en ${SOURCES_DIR} con repositorios de Debian que no apuntan a unstable/sid:" "$bad"
+
+    if [[ ! -f "$SOURCES_FILE" ]]; then
+        log_warn "No se encontró ${SOURCES_FILE} (formato deb822), así que no se puede verificar la suite. Este script no requiere haber corrido setup-debian-sid.sh para la mayoría de los pasos (apt resuelve dependencias solo), pero SIN este archivo la compilación de MangoHud con soporte NVML (paso 5) puede fallar por falta de deb-src."
+        _confirm_or_exit
     else
-        log_ok "Repos en formato deb822 apuntando a unstable/testing detectados correctamente"
+        log_ok "Repositorios en formato deb822 apuntando solo a unstable/sid"
     fi
 }
 
-# Antes, este chequeo solo avisaba y el script seguía igual sin importar la
-# respuesta -- un problema real en un sistema no-Sid podía aparecer recién
-# varios minutos después, en medio de la compilación de MangoHud, sin que
-# el mensaje de error dijera que la causa era esta. Ahora, si no se detecta
-# Sid/testing, se pide confirmación explícita antes de continuar.
-_confirm_or_exit_no_sid() {
+# Solo se usa cuando no se puede verificar la suite (falta debian.sources):
+# se pide confirmación explícita antes de continuar.
+_confirm_or_exit() {
     if [[ ! -t 0 ]]; then
-        log_err "No hay una terminal interactiva para confirmar (stdin no es un tty), así que no se puede preguntar. Se cancela por seguridad en vez de asumir una respuesta. Corré el script en una terminal interactiva, o en un sistema que sí sea Sid/testing."
+        log_err "No hay una terminal interactiva para confirmar (stdin no es un tty), así que no se puede preguntar. Se cancela por seguridad en vez de asumir una respuesta. Ejecuta el script en una terminal interactiva."
         exit 1
     fi
     read -rp "¿Continuar de todos modos? [s/N]: " respuesta
@@ -168,47 +277,70 @@ _confirm_or_exit_no_sid() {
     fi
 }
 
+# Pregunta [s/N] para pasos opcionales. Devuelve 0 solo si se responde s/S;
+# sin terminal interactiva devuelve 1 (el paso opcional se omite).
+ask_optional() {
+    local prompt="$1" respuesta
+    if [[ ! -t 0 ]]; then
+        log_info "Sin terminal interactiva: se omite el paso opcional (${prompt})"
+        return 1
+    fi
+    read -rp "${prompt} [s/N]: " respuesta
+    [[ "$respuesta" =~ ^[sS]$ ]]
+}
+
 # ---------------------------------------------------------------------------
-# 1. Steam (.deb oficial de Valve)
+# 1. Steam (steam-installer, repositorio oficial de Debian)
 # ---------------------------------------------------------------------------
 step_steam() {
-    log_step "1/11 · Instalando Steam (.deb oficial de Valve)"
+    log_step "1/14 · Instalando Steam (steam-installer, repositorio oficial de Debian)"
 
-    if pkg_installed steam-launcher || pkg_installed steam-installer; then
-        log_ok "Steam ya estaba instalado"
+    # No se mezclan los dos empaquetados: si ya está el paquete de Valve
+    # (steam-launcher), se respeta tal cual.
+    if pkg_installed steam-launcher; then
+        log_ok "Steam ya está instalado con el paquete de Valve (steam-launcher); no se mezcla con steam-installer de Debian"
         return
     fi
 
-    if ! dpkg --print-foreign-architectures | grep -q '^i386$'; then
-        sudo dpkg --add-architecture i386
-        sudo apt update
+    local foreign_archs
+    foreign_archs="$(dpkg --print-foreign-architectures 2>/dev/null)"
+    if ! grep -qx 'i386' <<<"$foreign_archs"; then
+        if ! sudo dpkg --add-architecture i386; then
+            log_err "No se pudo habilitar la arquitectura i386. Se omite Steam."
+            return 1
+        fi
+        if ! sudo apt update; then
+            log_err "Falló 'apt update' después de habilitar la arquitectura i386. Se omite Steam."
+            return 1
+        fi
     fi
 
-    local tmp_deb
-    tmp_deb="$(mktemp --suffix=.deb)"
-    register_tmp_path "$tmp_deb"
-    log_info "Descargando el .deb oficial de Steam"
-    if ! curl -fsSL "https://cdn.cloudflare.steamstatic.com/client/installer/steam.deb" -o "$tmp_deb"; then
-        log_err "No se pudo descargar el .deb de Steam (revisá conectividad). Se omite este paso."
-        rm -f "$tmp_deb"
+    # steam-installer vive en el componente 'contrib'. Se comprueba antes de
+    # instalar para que, si falta, el motivo quede claro.
+    if ! apt-cache show steam-installer &>/dev/null; then
+        log_err "steam-installer no está disponible en tus repositorios. Vive en el componente 'contrib': comprueba que esté en 'Components:' de ${SOURCES_FILE} y ejecuta 'sudo apt update'. Se omite este paso."
         return 1
     fi
 
-    if ! sudo apt install -y "$tmp_deb"; then
-        log_err "Falló la instalación del .deb de Steam. Se omite; el resto del script continúa."
-        rm -f "$tmp_deb"
+    if pkg_installed steam-installer; then
+        log_info "steam-installer ya estaba instalado; se comprueba si hay una versión nueva"
+    else
+        log_info "Steam mostrará su acuerdo de licencia durante la instalación (pantalla azul en la terminal): léelo y acéptalo para continuar."
+    fi
+
+    if ! sudo apt install -y steam-installer; then
+        log_err "Falló la instalación de steam-installer. Se omite; el resto del script continúa."
         return 1
     fi
 
-    rm -f "$tmp_deb"
-    log_ok "Steam instalado"
+    log_ok "Steam instalado/actualizado (steam-installer). En el primer arranque descargará el cliente de Steam."
 }
 
 # ---------------------------------------------------------------------------
 # 2. Flatpak + Flathub (por si el proyecto base todavía no lo dejó listo)
 # ---------------------------------------------------------------------------
 step_ensure_flatpak() {
-    log_step "2/11 · Instalando/actualizando Flatpak y Flathub"
+    log_step "2/14 · Instalando/actualizando Flatpak y Flathub"
 
     # Sin pre-chequeo 'pkg_installed': 'apt install' sobre un paquete ya
     # instalado es idempotente (no hace nada si ya está en la última
@@ -233,7 +365,7 @@ step_ensure_flatpak() {
 # 3. ProtonPlus (Flatpak — es el método principal recomendado por el propio proyecto)
 # ---------------------------------------------------------------------------
 step_protonplus() {
-    log_step "3/11 · Instalando/actualizando ProtonPlus (Flatpak)"
+    log_step "3/14 · Instalando/actualizando ProtonPlus (Flatpak)"
 
     if flatpak_installed com.vysp3r.ProtonPlus; then
         # Ya instalado: 'flatpak update' es el comando correcto para
@@ -259,7 +391,7 @@ step_protonplus() {
 # 4. Heroic Games Launcher (.deb oficial, auto-actualizado desde GitHub)
 # ---------------------------------------------------------------------------
 step_heroic_launcher() {
-    log_step "4/11 · Descargando e instalando/actualizando Heroic Games Launcher"
+    log_step "4/14 · Descargando e instalando/actualizando Heroic Games Launcher"
 
     local api_url="https://api.github.com/repos/Heroic-Games-Launcher/HeroicGamesLauncher/releases/latest"
     local deb_url
@@ -294,7 +426,7 @@ step_heroic_launcher() {
     register_tmp_path "$tmp_deb"
     log_info "Descargando: ${deb_url}"
     if ! curl -fsSL "$deb_url" -o "$tmp_deb"; then
-        log_err "No se pudo descargar el .deb de Heroic (revisá conectividad). Se omite este paso."
+        log_err "No se pudo descargar el .deb de Heroic (revisa conectividad). Se omite este paso."
         rm -f "$tmp_deb"
         return 1
     fi
@@ -310,7 +442,7 @@ step_heroic_launcher() {
 }
 
 # ---------------------------------------------------------------------------
-# 5. GameMode + MangoHud (compilado desde fuente con NVML) + MangoJuice (Flatpak)
+# 5. GameMode + MangoHud (compilado desde fuente con NVML) + MangoJuice (Flatpak, opcional)
 # ---------------------------------------------------------------------------
 
 # Devuelve 0 (éxito) si el MangoHud instalado en el sistema tiene soporte
@@ -336,51 +468,86 @@ mangohud_has_nvml() {
         "nvmlInit_v2"
         "nvmlDeviceGetHandleByPciBusId_v2"
     )
-    local sym
+    # La salida de 'strings' se captura UNA vez (es enorme): con
+    # 'strings | grep -q' y pipefail, grep sale al primer acierto, strings
+    # muere por SIGPIPE y la comprobación daba falsos negativos.
+    local sym strings_out
+    strings_out="$(strings "$lib" 2>/dev/null)"
     for sym in "${symbols[@]}"; do
-        if strings "$lib" 2>/dev/null | grep -qi "$sym"; then
+        if grep -qi -- "$sym" <<<"$strings_out"; then
             return 0
         fi
     done
     return 1
 }
 
-# 'mangohud --version' sigue el formato de 'git describe' (vX.Y.Z-N-gHASH).
-# Esto extrae el HASH corto, que identifica exactamente qué commit de
-# upstream quedó compilado. Vacío si mangohud no está instalado o si por
-# casualidad HEAD coincide exactamente con un tag (sin sufijo -N-gHASH).
-mangohud_installed_git_hash() {
-    command -v mangohud &>/dev/null || return 1
-    mangohud --version 2>/dev/null | grep -oP -- '-g\K[0-9a-f]{7,40}$'
+# 'mangohud --version' sigue el formato de 'git describe' (vX.Y.Z-N-gHASH,
+# y a veces con sufijo -dirty). Esto extrae solo la parte X.Y.Z, para que
+# comparar contra un tag limpio (vX.Y.Z) no falle por un sufijo que no
+# indica ningún problema real -- evita recompilar en cada ejecución por
+# una comparación de string demasiado estricta.
+_mangohud_version_base() {
+    grep -oP '^v?\K[0-9]+\.[0-9]+\.[0-9]+' <<<"$1" | head -n1
 }
 
-# Compara el commit instalado contra el HEAD actual de la rama por
-# defecto de upstream. Si coinciden (o no se puede determinar, por
-# ejemplo sin conectividad), no recompila -- evita gastar varios minutos
-# de compilación en cada corrida del script cuando no hay nada nuevo.
-# Si son distintos, recompila para traer la versión nueva.
+# Último tag estable de MangoHud (vX.Y.Z). Vacío si no hay conectividad
+# con GitHub. Extractor de valor: nada consulta su código de salida en un
+# 'if', así que la tubería con 'head -n1' no tiene el problema de
+# SIGPIPE+pipefail que se evita en otras comprobaciones de este script.
+_mangohud_latest_tag() {
+    git ls-remote --tags --refs --sort=-v:refname \
+        https://github.com/flightlessmango/MangoHud.git 'v*' 2>/dev/null \
+        | awk '{sub("refs/tags/", "", $2); print $2}' \
+        | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' \
+        | head -n1
+}
+
+# Compara la versión instalada y la presencia de NVML contra el último tag
+# estable. Si no coinciden, recompila MangoHud desde upstream fijando
+# exactamente ese tag (nunca el HEAD de la rama de desarrollo, que
+# upstream ha roto varias veces con dependencias nuevas sin avisar).
 _mangohud_check_and_maybe_recompile() {
+    local mangohud_tag="" installed="" installed_base tag_base
+
+    mangohud_tag="$(_mangohud_latest_tag)"
+    if command -v mangohud &>/dev/null; then
+        installed="$(mangohud --version 2>/dev/null | head -n1)"
+    fi
+
+    if [[ -z "$mangohud_tag" ]]; then
+        if command -v mangohud &>/dev/null && mangohud_has_nvml; then
+            log_warn "No se pudo consultar el último tag estable de MangoHud (¿sin conectividad?). Se deja la versión instalada: ${installed:-desconocida} (con NVML)."
+            return 0
+        fi
+        if ! command -v mangohud &>/dev/null; then
+            log_err "No se pudo consultar el último tag estable de MangoHud y no está instalado. Se omite este paso; el resto del script continúa."
+        else
+            log_err "No se pudo consultar el último tag estable de MangoHud y la build instalada no tiene NVML. Se omite este paso; el resto del script continúa."
+        fi
+        return 1
+    fi
+
+    installed_base="$(_mangohud_version_base "$installed")"
+    tag_base="$(_mangohud_version_base "$mangohud_tag")"
+
+    if command -v mangohud &>/dev/null && mangohud_has_nvml \
+        && [[ -n "$installed_base" && "$installed_base" == "$tag_base" ]]; then
+        log_ok "MangoHud ${mangohud_tag} ya está instalado con NVML"
+        return 0
+    fi
+
+    log_info "MangoHud requiere instalación/recompilación (objetivo: ${mangohud_tag}, instalado: ${installed:-ninguno})."
     if ! mangohud_has_nvml; then
-        log_info "MangoHud no está instalado (o le falta NVML). Compilando..."
-        step_mangohud_compile_nvml
-        return
+        log_info "Motivo: falta soporte NVML."
+    elif [[ "$installed_base" != "$tag_base" ]]; then
+        log_info "Motivo: no coincide con el último tag estable."
     fi
 
-    local installed_hash remote_hash
-    installed_hash="$(mangohud_installed_git_hash)"
-    remote_hash="$(git ls-remote https://github.com/flightlessmango/MangoHud.git HEAD 2>/dev/null | awk '{print $1}')"
-
-    if [[ -z "$remote_hash" ]]; then
-        log_warn "No se pudo consultar el último commit de MangoHud en GitHub (¿sin conectividad?). Se deja la versión ya instalada (${installed_hash:-desconocida}) sin recompilar."
-        return
-    fi
-
-    if [[ -n "$installed_hash" && "$remote_hash" == "$installed_hash"* ]]; then
-        log_ok "MangoHud ya está instalado con NVML y en el último commit de upstream (${installed_hash})"
-        return
-    fi
-
-    log_info "Hay una versión más nueva de MangoHud en upstream (instalado: ${installed_hash:-desconocido}, remoto: ${remote_hash:0:8}). Recompilando..."
+    # Variable global intencionada: step_mangohud_compile_nvml() la usa
+    # para clonar exactamente este tag. Es la única función que la llama
+    # (comprobado: no aparece en ningún otro sitio del script), así que
+    # basta con fijarla justo antes de usarla.
+    MANGOHUD_TAG="$mangohud_tag"
     step_mangohud_compile_nvml
 }
 
@@ -391,8 +558,12 @@ step_mangohud_compile_nvml() {
     # (por ejemplo de una ejecución vieja del script), lo sacamos primero
     # para que la instalación manual (ninja install) no choque con dpkg.
     if pkg_installed mangohud; then
-        log_info "Desinstalando el paquete 'mangohud' de apt (build sin NVML) antes de compilar"
-        sudo apt remove -y mangohud
+        log_warn "Se eliminará el paquete Debian de MangoHud (build sin NVML) antes de instalar la versión compilada desde upstream."
+        log_warn "Si la compilación falla, MangoHud quedará temporalmente sin instalar."
+        if ! sudo apt remove -y mangohud; then
+            log_err "No se pudo eliminar el paquete Debian de MangoHud; se omite la compilación para no chocar con dpkg."
+            return 1
+        fi
     fi
 
     # Repos de código fuente (formato deb822). A diferencia de un chequeo
@@ -406,10 +577,12 @@ step_mangohud_compile_nvml() {
     if [[ -f "$sources_file" ]]; then
         if sudo grep -q '^Types: deb$' "$sources_file"; then
             sudo sed -i '/^Types: deb$/s/^Types: deb$/Types: deb deb-src/' "$sources_file"
-            sudo apt update
+            if ! sudo apt update; then
+                log_warn "'apt update' falló después de activar deb-src; 'apt build-dep mangohud' puede fallar por índices desactualizados."
+            fi
         fi
     else
-        log_warn "No se encontró ${sources_file} (formato deb822). No se pudo activar deb-src automáticamente; 'apt build-dep mangohud' puede fallar por falta de fuentes. Revisá que tus repos estén en ese formato (los deja listos setup-debian-sid.sh)."
+        log_warn "No se encontró ${sources_file} (formato deb822). No se pudo activar deb-src automáticamente; 'apt build-dep mangohud' puede fallar por falta de fuentes. Revisa que tus repos estén en ese formato (los deja listos setup-debian-sid.sh)."
     fi
 
     if ! sudo apt build-dep -y mangohud; then
@@ -443,11 +616,12 @@ step_mangohud_compile_nvml() {
     local build_dir
     build_dir="$(mktemp -d)"
     register_tmp_path "$build_dir"
-    if ! git clone --recursive https://github.com/flightlessmango/MangoHud.git "${build_dir}/MangoHud"; then
-        log_err "No se pudo clonar el repositorio de MangoHud (revisá conectividad). Se aborta la compilación; el resto del script continúa."
+    if ! git clone --recursive --branch "$MANGOHUD_TAG" https://github.com/flightlessmango/MangoHud.git "${build_dir}/MangoHud"; then
+        log_err "No se pudo clonar el repositorio de MangoHud (revisa conectividad). Se aborta la compilación; el resto del script continúa."
         rm -rf "$build_dir"
         return 1
     fi
+    log_ok "MangoHud ${MANGOHUD_TAG} descargado"
 
     # Entorno de pkg-config estándar de Debian (multiarch), por si el
     # entorno heredado trae un PKG_CONFIG_PATH/PKG_CONFIG_LIBDIR que
@@ -511,7 +685,7 @@ step_mangohud_compile_nvml() {
                 | grep -E ':[[:space:]]*/?usr/(lib/[^/]+/pkgconfig|lib/pkgconfig|share/pkgconfig)/' \
                 | sort -u | head -n1 | cut -d: -f1)"
             if [[ -z "$pkg" ]]; then
-                log_warn "No se encontró ningún paquete que provea '${dep}.pc' en una ruta estándar de pkg-config vía apt-file. Esta dependencia hay que resolverla a mano (buscá en https://packages.debian.org/search?searchon=contents&keywords=${dep}.pc)."
+                log_warn "No se encontró ningún paquete que provea '${dep}.pc' en una ruta estándar de pkg-config vía apt-file. Esta dependencia hay que resolverla a mano (busca en https://packages.debian.org/search?searchon=contents&keywords=${dep}.pc)."
                 continue
             fi
             if [[ " $tried_pkgs " == *" $pkg "* ]]; then
@@ -546,7 +720,7 @@ step_mangohud_compile_nvml() {
 
         log_warn "Intento ${attempt}/${max_attempts} de compilación de MangoHud falló. Buscando dependencias de meson faltantes en el log..."
         if ! _mangohud_resolve_missing_meson_deps; then
-            log_err "La compilación/instalación de MangoHud falló (meson/ninja) y no se detectaron (o no se pudieron resolver) más dependencias faltantes en ${meson_log}. Revisá el log para más detalle. Se aborta este paso; el resto del script continúa."
+            log_err "La compilación/instalación de MangoHud falló (meson/ninja) y no se detectaron (o no se pudieron resolver) más dependencias faltantes en ${meson_log}. Revisa el log para más detalle. Se aborta este paso; el resto del script continúa."
             break
         fi
         ((attempt++))
@@ -562,14 +736,68 @@ step_mangohud_compile_nvml() {
     rm -rf "$build_dir"
 
     if mangohud_has_nvml; then
-        log_ok "MangoHud compilado e instalado con soporte NVML"
+        local installed_now installed_now_base tag_base_final
+        installed_now="$(mangohud --version 2>/dev/null | head -n1)"
+        installed_now_base="$(_mangohud_version_base "$installed_now")"
+        tag_base_final="$(_mangohud_version_base "${MANGOHUD_TAG:-}")"
+        if [[ -n "$tag_base_final" && "$installed_now_base" != "$tag_base_final" ]]; then
+            log_warn "MangoHud compilado con NVML, pero 'mangohud --version' reporta '${installed_now}' en vez de '${MANGOHUD_TAG}'. La comparación de versiones de este script podría no funcionar como se espera (recompilaría en cada ejecución); revisa el formato de 'mangohud --version' a mano."
+        else
+            log_ok "MangoHud compilado e instalado con soporte NVML (${installed_now:-$MANGOHUD_TAG})"
+        fi
     else
-        log_warn "MangoHud se instaló pero no se detectó soporte NVML. Revisá el log de meson si tenés GPU NVIDIA."
+        log_warn "MangoHud se instaló pero no se detectó soporte NVML. Revisa el log de meson si tienes GPU NVIDIA."
+    fi
+}
+
+# MangoJuice: interfaz gráfica (Flatpak) para configurar MangoHud. Es solo una
+# alternativa: se pregunta si se quiere instalar y cada uno decide. Si ya
+# está instalado, se actualiza sin preguntar. MangoHud se puede configurar
+# igualmente editando ~/.config/MangoHud/MangoHud.conf.
+_offer_mangojuice() {
+    local app_id="io.github.radiolamp.mangojuice"
+
+    if ! command -v flatpak &>/dev/null; then
+        MANGOJUICE_STATE="sin_flatpak"
+        log_info "Flatpak no está disponible: se omite la oferta de MangoJuice"
+        return 0
+    fi
+
+    if flatpak_installed "$app_id"; then
+        MANGOJUICE_STATE="instalado"
+        if flatpak update -y "$app_id"; then
+            log_ok "MangoJuice comprobado/actualizado"
+        else
+            log_err "Falló la actualización de MangoJuice. Se continúa con la versión ya instalada."
+        fi
+        return 0
+    fi
+
+    if ! flatpak remote-info flathub "$app_id" &>/dev/null; then
+        MANGOJUICE_STATE="fallo_consulta"
+        log_warn "No se pudo consultar MangoJuice en Flathub (¿sin conexión?). Se omite."
+        return 1
+    fi
+
+    if ! ask_optional "¿Desea instalar MangoJuice (Flatpak) como interfaz gráfica opcional para MangoHud?"; then
+        MANGOJUICE_STATE="rechazado"
+        log_info "Se omite MangoJuice"
+        return 0
+    fi
+
+    if flatpak install -y flathub "$app_id"; then
+        MANGOJUICE_STATE="instalado"
+        log_ok "MangoJuice instalado (vía Flatpak)"
+        log_info "Si no llega a leer/escribir ~/.config/MangoHud por el sandbox, prueba: flatpak override --user --filesystem=xdg-config/MangoHud ${app_id}"
+    else
+        MANGOJUICE_STATE="fallo_instalacion"
+        log_err "Falló la instalación de MangoJuice. Puedes configurar MangoHud.conf a mano."
+        return 1
     fi
 }
 
 step_gamemode_mangohud() {
-    log_step "5/11 · Instalando GameMode, MangoHud (compilado con NVML) y MangoJuice (Flatpak)"
+    log_step "5/14 · Instalando GameMode y MangoHud (compilado con NVML)"
 
     if sudo apt install -y gamemode; then
         log_ok "GameMode instalado/actualizado (vía apt)"
@@ -579,27 +807,130 @@ step_gamemode_mangohud() {
 
     _mangohud_check_and_maybe_recompile
 
-    if flatpak_installed io.github.radiolamp.mangojuice; then
-        if flatpak update -y io.github.radiolamp.mangojuice; then
-            log_ok "MangoJuice comprobado/actualizado"
-        else
-            log_err "Falló la actualización de MangoJuice. Se continúa con la versión ya instalada."
-        fi
-    else
-        if flatpak install -y flathub io.github.radiolamp.mangojuice; then
-            log_ok "MangoJuice instalado (vía Flatpak; permisos correctos de fábrica hacia ~/.config/MangoHud, sin necesitar 'flatpak override')"
-        else
-            log_err "Falló la instalación de MangoJuice. Podés configurar MangoHud.conf a mano."
-        fi
-    fi
+    _offer_mangojuice
 
-    log_info "Para usarlos, en las opciones de lanzamiento de un juego en Steam poné:"
+    log_info "Para usarlos, en las opciones de lanzamiento de un juego en Steam pon:"
     log_info "  gamemoderun mangohud %command%"
-    log_info "Podés configurar el overlay de MangoHud gráficamente abriendo MangoJuice."
+    log_info "Puedes configurar el overlay de MangoHud editando ~/.config/MangoHud/MangoHud.conf (o con MangoJuice, si lo instalas)."
 }
 
 # ---------------------------------------------------------------------------
-# 6. Valores por defecto de ~/.config/gamemode.ini (solo si no existe)
+# 6. Winetricks + Protontricks (paquetes nativos de Debian)
+# ---------------------------------------------------------------------------
+#
+# Ambos están empaquetados de forma nativa en Debian, sin necesidad de
+# Flatpak ni compilar nada: winetricks y protontricks viven en el componente
+# 'contrib' (protontricks depende de winetricks + python3-pil + python3-vdf,
+# que apt resuelve solo). El componente 'contrib' no siempre
+# está habilitado en sources.list -- si falta, 'apt install protontricks'
+# falla con un genérico "Unable to locate package" que no deja claro que
+# la causa es el componente, así que se avisa antes de intentar.
+# Debian (wine 10.0~repack-12 y posteriores) ya no instala un lanzador
+# /usr/bin/wineserver: el binario real vive dentro de los paquetes de Wine y
+# winetricks falla con "wineserver not found!". Si Wine está instalado y
+# 'wineserver' no está en el PATH, se crea un enlace en /usr/local/bin hacia
+# el binario real y se comprueba que responde. El binario real se busca con
+# dpkg (no con una ruta fija, que puede cambiar entre versiones de Debian).
+# No se toca nada si ya funciona ni ficheros ajenos.
+_ensure_wineserver_in_path() {
+    local link="/usr/local/bin/wineserver" real="" candidate dpkg_list version
+
+    if command -v wineserver &>/dev/null && wineserver --version &>/dev/null; then
+        log_ok "wineserver ya funciona ($(command -v wineserver))"
+        return 0
+    fi
+
+    dpkg_list="$(dpkg -L libwine wine64 2>/dev/null)"
+    while IFS= read -r candidate; do
+        if [[ "${candidate##*/}" == "wineserver" && -f "$candidate" && -x "$candidate" ]]; then
+            real="$candidate"
+            break
+        fi
+    done <<<"$dpkg_list"
+
+    if [[ -z "$real" ]]; then
+        log_info "No se encontró el binario de wineserver en los paquetes de Wine (¿Wine no está instalado?). Se omite el enlace."
+        return 0
+    fi
+
+    if [[ -e "$link" && ! -L "$link" ]]; then
+        log_warn "${link} existe y no es un enlace: no se toca. Winetricks puede fallar con 'wineserver not found!'."
+        return 1
+    fi
+
+    log_info "wineserver no está en el PATH; se crea un enlace: ${link} -> ${real}"
+    if ! sudo ln -sfn "$real" "$link"; then
+        log_err "No se pudo crear el enlace ${link}"
+        return 1
+    fi
+    hash -r
+
+    if version="$(wineserver --version 2>/dev/null)" && [[ -n "$version" ]]; then
+        log_ok "wineserver disponible (${version})"
+    else
+        log_err "El enlace ${link} se creó pero 'wineserver --version' no responde. Comprueba que /usr/local/bin está en tu PATH."
+        return 1
+    fi
+}
+
+# Wine 10 de Debian ejecuta aplicaciones de 32 bits de forma nativa en amd64
+# (WoW64), así que wine32:i386 NO es imprescindible. Se intenta instalar, pero
+# antes se simula: solo se instala si la simulación no da errores ni elimina
+# paquetes. Si en Sid hay un conflicto temporal de dependencias (por ejemplo
+# con libsnappy1v5) se informa y se continúa, sin downgrades ni mezclar
+# paquetes de otras versiones.
+_try_install_wine32() {
+    if pkg_installed wine32:i386; then
+        log_ok "wine32:i386 ya está instalado"
+        return 0
+    fi
+
+    if ! apt-cache show wine32:i386 &>/dev/null; then
+        log_info "wine32:i386 no está disponible en tus repositorios; no es imprescindible (Wine ya ejecuta apps de 32 bits)."
+        return 0
+    fi
+
+    local sim rc
+    sim="$(LC_ALL=C apt-get -s install wine32:i386 2>&1)"
+    rc=$?
+
+    if [[ "$rc" -ne 0 ]]; then
+        log_warn "wine32:i386 no se puede instalar ahora mismo (probable conflicto temporal de dependencias en Sid). Se continúa sin él; no es imprescindible."
+        grep -E '^E:|Depends:|Conflicts:|unmet dependencies' <<<"$sim" | head -4 | sed 's/^/      · /'
+        return 0
+    fi
+
+    if grep -q '^Remv' <<<"$sim"; then
+        log_warn "Instalar wine32:i386 eliminaría paquetes ya instalados; no se instala. Se continúa sin él."
+        return 0
+    fi
+
+    if sudo apt install -y wine32:i386; then
+        log_ok "wine32:i386 instalado"
+    else
+        log_warn "Falló la instalación de wine32:i386. Se continúa sin él; no es imprescindible."
+    fi
+}
+
+step_winetricks_protontricks() {
+    log_step "6/14 · Instalando Winetricks y Protontricks"
+
+    local sources_file="/etc/apt/sources.list.d/debian.sources"
+    if [[ -f "$sources_file" ]] && ! grep -qE '^Components:.*\bcontrib\b' "$sources_file"; then
+        log_warn "No se detectó el componente 'contrib' habilitado en ${sources_file}. Winetricks y Protontricks viven en 'contrib'; si la instalación de abajo falla, ese es probablemente el motivo -- agrega 'contrib' a la línea 'Components:' y ejecuta 'sudo apt update'."
+    fi
+
+    if sudo apt install -y winetricks protontricks; then
+        log_ok "Winetricks y Protontricks instalados/actualizados"
+        _ensure_wineserver_in_path
+        _try_install_wine32
+    else
+        log_err "Falló la instalación de Winetricks/Protontricks. Se omite; el resto del script continúa."
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# 7. Valores por defecto de ~/.config/gamemode.ini (solo si no existe)
 # ---------------------------------------------------------------------------
 #
 # IMPORTANTE -- por qué "solo si no existe" y no "siempre pisar con estos
@@ -658,7 +989,7 @@ _gamemode_pick_governor() {
 }
 
 step_gamemode_ini_defaults() {
-    log_step "6/11 · Configurando valores por defecto de ~/.config/gamemode.ini"
+    log_step "7/14 · Configurando valores por defecto de ~/.config/gamemode.ini"
 
     local gamemode_ini="${HOME}/.config/gamemode.ini"
     local marker="# gamemode.ini -- configurado por setup-gaming-debian-sid.sh"
@@ -669,7 +1000,7 @@ step_gamemode_ini_defaults() {
     fi
 
     if [[ -f "$gamemode_ini" ]]; then
-        log_warn "${gamemode_ini} ya existe pero no lo generó este script (no tiene el marcador esperado). Se deja intacto para no pisar tu configuración; revisalo a mano si querés aplicar un gobernador dinámico vos mismo."
+        log_warn "${gamemode_ini} ya existe pero no lo generó este script (no tiene el marcador esperado). Se deja intacto para no pisar tu configuración; revísalo a mano si quieres aplicar un gobernador dinámico tú mismo."
         return
     fi
 
@@ -700,7 +1031,7 @@ GAMEMODE_INI_EOF
 # selecciona por índice DRM, no por PCI), puede pisar el filtrado y
 # volver a leer la GPU equivocada.
 step_mangohud_pci_dev() {
-    log_step "7/11 · Configurando pci_dev de la GPU NVIDIA en MangoHud.conf"
+    log_step "8/14 · Configurando pci_dev de la GPU NVIDIA en MangoHud.conf"
 
     if ! command -v nvidia-smi &>/dev/null; then
         log_info "No se detectó 'nvidia-smi'; se omite (no hay GPU NVIDIA o falta el driver)"
@@ -710,7 +1041,7 @@ step_mangohud_pci_dev() {
     local bus_id
     bus_id="$(nvidia-smi --query-gpu=pci.bus_id --format=csv,noheader 2>/dev/null | head -n1)"
     if [[ -z "$bus_id" ]]; then
-        log_warn "No se pudo obtener el pci.bus_id vía nvidia-smi. Configurá pci_dev manualmente en MangoHud.conf."
+        log_warn "No se pudo obtener el pci.bus_id vía nvidia-smi. Configura pci_dev manualmente en MangoHud.conf."
         return
     fi
 
@@ -734,18 +1065,18 @@ step_mangohud_pci_dev() {
     fi
 
     if grep -q '^gpu_list=' "$config_file"; then
-        log_warn "Se detectó 'gpu_list=' en ${config_file}: en equipos con GPU híbrida puede entrar en conflicto con 'pci_dev' y hacer que MangoHud lea la GPU equivocada. Si el % de GPU sale mal, comentá o borrá esa línea."
+        log_warn "Se detectó 'gpu_list=' en ${config_file}: en equipos con GPU híbrida puede entrar en conflicto con 'pci_dev' y hacer que MangoHud lea la GPU equivocada. Si el % de GPU sale mal, comenta o borra esa línea."
     fi
 }
 
 # ---------------------------------------------------------------------------
-# 7. Herramientas de diagnóstico (mesa-utils: glxgears, glxinfo...)
+# 9. Herramientas de diagnóstico (mesa-utils: glxgears, glxinfo...)
 # ---------------------------------------------------------------------------
 
 # No forman parte del setup de gaming en sí; sirven para probar drivers,
 # MangoHud, etc. sin depender de abrir un juego completo.
 step_diagnostic_tools() {
-    log_step "8/11 · Instalando/actualizando herramientas de diagnóstico (mesa-utils)"
+    log_step "9/14 · Instalando/actualizando herramientas de diagnóstico (mesa-utils)"
 
     if sudo apt install -y mesa-utils; then
         log_ok "mesa-utils instalado/actualizado (glxgears, glxinfo — útiles para probar drivers/MangoHud rápido)"
@@ -755,10 +1086,10 @@ step_diagnostic_tools() {
 }
 
 # ---------------------------------------------------------------------------
-# 8. vm.max_map_count elevado (recomendado por varios juegos/motores modernos)
+# 10. vm.max_map_count elevado (recomendado por varios juegos/motores modernos)
 # ---------------------------------------------------------------------------
 step_max_map_count() {
-    log_step "9/11 · Ajustando vm.max_map_count"
+    log_step "10/14 · Ajustando vm.max_map_count"
 
     local sysctl_file="/etc/sysctl.d/80-gamecompatibility.conf"
     if [[ -f "$sysctl_file" ]] && grep -q '^vm.max_map_count=2147483642' "$sysctl_file"; then
@@ -771,55 +1102,83 @@ step_max_map_count() {
 }
 
 # ---------------------------------------------------------------------------
-# 9. Verificar/activar ntsync
+# 11. Verificar/activar ntsync
 # ---------------------------------------------------------------------------
+# Carga el módulo ntsync con modprobe directamente (sin depender de modinfo,
+# que vive en /usr/sbin y no está en el PATH de un usuario normal) y espera
+# unos segundos a que udev cree /dev/ntsync.
+_ntsync_load_module() {
+    log_info "Cargando el módulo ntsync (modprobe)"
+    sudo modprobe ntsync || return 1
+    local _
+    for _ in 1 2 3 4 5 6; do
+        [[ -e /dev/ntsync ]] && return 0
+        sleep 0.5
+    done
+    return 0
+}
+
+# Explica la causa real cuando ntsync no se puede activar.
+_ntsync_explain_failure() {
+    local kernel cfg cfgval=""
+    kernel="$(uname -r)"
+    cfg="/boot/config-${kernel}"
+    [[ -r "$cfg" ]] && cfgval="$(grep -m1 '^CONFIG_NTSYNC=' "$cfg" | cut -d= -f2)"
+
+    if [[ ! -d "/lib/modules/${kernel}" ]]; then
+        log_warn "No existen los módulos del kernel en ejecución (/lib/modules/${kernel}); suele pasar tras actualizar el kernel sin reiniciar. Reinicia y vuelve a ejecutar el script."
+    elif [[ -r "$cfg" && -z "$cfgval" ]]; then
+        log_warn "Tu kernel (${kernel}) no incluye ntsync (CONFIG_NTSYNC no está definido). Se incorporó en el kernel 6.14; necesitas un kernel más reciente."
+    elif [[ "$cfgval" == "m" || "$cfgval" == "y" ]]; then
+        log_warn "El kernel declara CONFIG_NTSYNC=${cfgval}, pero ntsync no se ha podido activar. Mira el motivo con: dmesg | tail"
+    else
+        log_warn "No se pudo cargar ntsync y no se pudo leer la configuración del kernel (${cfg}). Prueba a mano: sudo modprobe ntsync"
+    fi
+}
+
 step_ntsync() {
-    log_step "10/11 · Verificando soporte de ntsync"
+    log_step "11/14 · Activando ntsync"
 
     local modules_file="/etc/modules-load.d/ntsync.conf"
 
-    # ntsync puede estar compilado como built-in (CONFIG_NTSYNC=y) o como
-    # módulo cargable (CONFIG_NTSYNC=m). Si está built-in, no hay módulo
-    # que lsmod/modinfo puedan detectar: la forma correcta de comprobarlo
-    # en ese caso es que exista el device /dev/ntsync.
-    if [[ -e /dev/ntsync ]]; then
-        log_ok "ntsync está activo (/dev/ntsync existe)"
-        if lsmod | grep -q '^ntsync' && [[ ! -f "$modules_file" ]]; then
-            # Solo hace falta persistir la carga si es módulo, no si es built-in
-            echo "ntsync" | sudo tee "$modules_file" >/dev/null
-            log_ok "ntsync configurado para cargarse automáticamente en cada arranque"
+    # ntsync puede estar compilado como módulo cargable (CONFIG_NTSYNC=m) o
+    # integrado en el kernel (CONFIG_NTSYNC=y). En ambos casos, la señal de
+    # que funciona es que exista /dev/ntsync. Si no existe, se intenta
+    # cargar el módulo directamente.
+    if [[ ! -e /dev/ntsync ]]; then
+        if ! _ntsync_load_module; then
+            _ntsync_explain_failure
+            return 1
         fi
-        return
     fi
 
-    if lsmod | grep -q '^ntsync'; then
-        log_ok "El módulo ntsync ya está cargado"
-        if [[ ! -f "$modules_file" ]]; then
-            echo "ntsync" | sudo tee "$modules_file" >/dev/null
-            log_ok "ntsync configurado para cargarse automáticamente en cada arranque"
-        fi
-        return
+    if [[ ! -e /dev/ntsync ]]; then
+        log_err "El módulo ntsync se cargó, pero /dev/ntsync no ha aparecido."
+        _ntsync_explain_failure
+        return 1
     fi
+    log_ok "ntsync está activo (/dev/ntsync existe)"
 
-    if modinfo ntsync &>/dev/null; then
-        sudo modprobe ntsync
-        if lsmod | grep -q '^ntsync'; then
-            log_ok "Módulo ntsync cargado correctamente"
-            if [[ ! -f "$modules_file" ]]; then
-                echo "ntsync" | sudo tee "$modules_file" >/dev/null
-                log_ok "ntsync configurado para cargarse automáticamente en cada arranque"
-            fi
+    # Persistencia: solo hace falta si es un módulo cargable (aparece en
+    # lsmod). Si está integrado en el kernel, no hay nada que cargar.
+    local loaded_modules
+    loaded_modules="$(lsmod 2>/dev/null)"
+    if grep -q '^ntsync' <<<"$loaded_modules"; then
+        if [[ -f "$modules_file" ]] && grep -qx 'ntsync' "$modules_file"; then
+            log_ok "ntsync ya estaba configurado para cargarse en cada arranque (${modules_file})"
+        elif echo "ntsync" | sudo tee "$modules_file" >/dev/null; then
+            log_ok "ntsync configurado para cargarse automáticamente en cada arranque (${modules_file})"
         else
-            log_warn "No se pudo cargar el módulo ntsync. Revisá que tu kernel lo soporte."
+            log_err "No se pudo escribir ${modules_file}; ntsync no se cargará solo tras reiniciar."
+            return 1
         fi
     else
-        log_warn "Tu kernel no trae el módulo ntsync (se incorporó a partir del kernel 6.14)."
-        log_warn "Debian Sid suele traer kernels recientes; si el tuyo es más viejo, actualizalo."
+        log_info "ntsync está integrado en el kernel: no hace falta configurar su carga"
     fi
 }
 
 # ---------------------------------------------------------------------------
-# 10. Wrapper game-performance (mismo patrón que usa CachyOS)
+# 12. Wrapper game-performance (mismo patrón que usa CachyOS)
 # ---------------------------------------------------------------------------
 # Sustituye a un enfoque de alias de bash (gaming-on/gaming-off), que NO
 # funciona dentro de las opciones de lanzamiento de Steam: un alias solo
@@ -853,16 +1212,20 @@ step_ntsync() {
 # nada y solo generaba más calor y ruido de ventilador. En otro equipo
 # (desktop con disipación de CPU y GPU separada, u otro laptop con mejor
 # cooling) el resultado bien podría ser el opuesto, o no notarse
-# diferencia alguna. No asumas ninguno de los dos casos: medilo vos con
+# diferencia alguna. No asumas ninguno de los dos casos: mídelo tú con
 # el overlay de MangoHud, juego por juego, ver el resumen final para el
 # método.
 step_install_game_performance() {
-    log_step "11/11 · Instalando wrapper game-performance"
+    log_step "12/14 · Instalando wrapper game-performance"
 
     if ! pkg_installed power-profiles-daemon; then
-        sudo apt install -y power-profiles-daemon
-        sudo systemctl enable --now power-profiles-daemon
-        log_ok "power-profiles-daemon instalado y activado"
+        if ! sudo apt install -y power-profiles-daemon; then
+            log_err "No se pudo instalar power-profiles-daemon. Se continúa: el wrapper game-performance funciona igualmente, pero sin cambiar el perfil de energía."
+        elif sudo systemctl enable --now power-profiles-daemon; then
+            log_ok "power-profiles-daemon instalado y activado"
+        else
+            log_warn "power-profiles-daemon se instaló, pero no se pudo activar el servicio. Prueba: sudo systemctl enable --now power-profiles-daemon"
+        fi
     else
         log_ok "power-profiles-daemon ya estaba instalado"
     fi
@@ -942,29 +1305,302 @@ WRAPPER_EOF
 }
 
 # ---------------------------------------------------------------------------
+# 13. Lutris (opcional, paquete de apt)
+# ---------------------------------------------------------------------------
+#
+# Lutris está en el componente 'contrib' de Debian Sid, en una versión
+# reciente, así que no hace falta Flatpak. Si ya está instalado se actualiza
+# sin preguntar; si no, se ofrece con una pregunta [s/N].
+step_lutris() {
+    log_step "13/14 · Lutris (opcional)"
+
+    if ! pkg_installed lutris; then
+        if ! apt-cache show lutris &>/dev/null; then
+            log_warn "Lutris no está disponible en tus repositorios (vive en 'contrib'). Se omite este paso."
+            return 1
+        fi
+        if ! ask_optional "¿Instalar Lutris (repositorio oficial de Debian, contrib)?"; then
+            log_info "Se omite Lutris"
+            return 0
+        fi
+    fi
+
+    if sudo apt install -y lutris; then
+        log_ok "Lutris instalado/actualizado (vía apt)"
+    else
+        log_err "Falló la instalación de Lutris. Se omite; el resto del script continúa."
+        return 1
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# 14. Gamescope (opcional, paquete de apt)
+# ---------------------------------------------------------------------------
+#
+# Micro-compositor de Valve para escalado y pantalla completa. Está en el
+# componente 'contrib' de Debian Sid. Es situacional, así que solo se
+# instala si se responde que sí; con GPU híbrida NVIDIA puede requerir
+# pruebas según el juego.
+step_gamescope() {
+    log_step "14/14 · Gamescope (opcional)"
+
+    if ! pkg_installed gamescope; then
+        if ! apt-cache show gamescope &>/dev/null; then
+            log_warn "Gamescope no está disponible en tus repositorios (vive en 'contrib'). Se omite este paso."
+            return 1
+        fi
+        if ! ask_optional "¿Instalar Gamescope (repositorio oficial de Debian, contrib)?"; then
+            log_info "Se omite Gamescope"
+            return 0
+        fi
+    fi
+
+    if sudo apt install -y gamescope; then
+        log_ok "Gamescope instalado/actualizado (vía apt)"
+        log_info "Uso en Steam (opciones de lanzamiento): gamescope -f -- %command%"
+    else
+        log_err "Falló la instalación de Gamescope. Se omite; el resto del script continúa."
+        return 1
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# Verificaciones finales (solo comprueban; no lanzan Steam ni juegos)
+# ---------------------------------------------------------------------------
+#
+# Steam: si sus carpetas aún no existen, es normal en una instalación limpia
+# (Steam las crea la primera vez que se abre). El script NO lo lanza: se deja
+# como paso manual pendiente. Si Steam ya existe y Protontricks no lo
+# encuentra, se crea el enlace ~/.local/share/Steam como último recurso, sin
+# tocar nada si ya existe.
+# Estado de componentes con tres categorías:
+#   OK             -> instalado/preparado
+#   ADVERTENCIA    -> requiere una acción manual (o no es lo ideal, pero no rompe nada)
+#   NO DISPONIBLE  -> no se pudo instalar o no responde
+# Nada de esto es fatal: el script no cambia su código de salida por lo que
+# salga aquí (lo opcional o lo que depende de una acción del usuario no son
+# errores).
+CHK_OK=0
+CHK_WARN=0
+CHK_NA=0
+MANUAL_STEPS=()
+
+_chk() {
+    case "$1" in
+        OK)   CHK_OK=$((CHK_OK + 1));     echo -e "  ${COLOR_GREEN}[ OK ]${COLOR_RESET}           $2" ;;
+        WARN) CHK_WARN=$((CHK_WARN + 1)); echo -e "  ${COLOR_YELLOW}[ADVERTENCIA]${COLOR_RESET}     $2" ;;
+        NA)   CHK_NA=$((CHK_NA + 1));     echo -e "  ${COLOR_RED}[NO DISPONIBLE]${COLOR_RESET}   $2" ;;
+    esac
+}
+
+step_final_checks() {
+    log_step "Verificaciones finales"
+
+    CHK_OK=0; CHK_WARN=0; CHK_NA=0; MANUAL_STEPS=()
+    local version
+
+    # --- Wine / wineserver / Winetricks / Protontricks ---
+    if command -v wine &>/dev/null && version="$(wine --version 2>/dev/null)" && [[ -n "$version" ]]; then
+        _chk OK "Wine: ${version}"
+    else
+        _chk NA "Wine: no responde ('wine --version'); Winetricks debería haberlo instalado"
+    fi
+
+    if command -v wineserver &>/dev/null && version="$(wineserver --version 2>/dev/null)" && [[ -n "$version" ]]; then
+        _chk OK "wineserver: ${version} ($(command -v wineserver))"
+    else
+        _chk NA "wineserver: no está en el PATH; Winetricks fallaría con 'wineserver not found!'"
+    fi
+
+    if command -v winetricks &>/dev/null; then
+        _chk OK "Winetricks: instalado ($(command -v winetricks))"
+    else
+        _chk NA "Winetricks: no está instalado"
+    fi
+
+    local protontricks_ok=0
+    if command -v protontricks &>/dev/null && version="$(protontricks --version 2>/dev/null)" && [[ -n "$version" ]]; then
+        protontricks_ok=1
+        _chk OK "Protontricks: ${version}"
+    else
+        _chk NA "Protontricks: no responde ('protontricks --version')"
+    fi
+
+    # --- Steam ---
+    # El script NO lanza Steam. Si sus carpetas aún no existen (normal en una
+    # instalación limpia), se deja como paso manual. Si existen y Protontricks
+    # no encuentra Steam, se crea ~/.local/share/Steam como último recurso, sin
+    # tocar nada si ya existe.
+    if pkg_installed steam-installer || pkg_installed steam-launcher; then
+        local steam_data_found=0 d
+        for d in "$HOME/.steam/debian-installation" "$HOME/.local/share/Steam" "$HOME/.steam/steam"; do
+            [[ -e "$d" ]] && steam_data_found=1
+        done
+
+        if [[ "$steam_data_found" -eq 0 ]]; then
+            _chk WARN "Steam: instalado, pero aún sin inicializar"
+            MANUAL_STEPS+=("Abre Steam una vez y deja que termine de descargarse (el script no lo lanza).")
+        elif [[ "$protontricks_ok" -eq 1 ]]; then
+            local pt_out
+            pt_out="$(protontricks -vv -l 2>&1)"
+            if ! grep -q 'Found Steam directory' <<<"$pt_out" \
+               && [[ -d "$HOME/.steam/debian-installation" && ! -e "$HOME/.local/share/Steam" && ! -L "$HOME/.local/share/Steam" ]]; then
+                log_info "Protontricks no encuentra Steam; se crea el enlace de compatibilidad ~/.local/share/Steam"
+                mkdir -p "$HOME/.local/share"
+                ln -sT "$HOME/.steam/debian-installation" "$HOME/.local/share/Steam"
+                pt_out="$(protontricks -vv -l 2>&1)"
+            fi
+
+            if grep -q 'Found Steam directory' <<<"$pt_out"; then
+                _chk OK "Steam: instalado y detectado por Protontricks"
+            else
+                _chk WARN "Steam: instalado, pero Protontricks no lo encuentra"
+                MANUAL_STEPS+=("Ejecuta 'protontricks -vv -l' para ver por qué no encuentra Steam.")
+            fi
+
+            if grep -q 'Found no games' <<<"$pt_out"; then
+                _chk WARN "Protontricks: aún no lista juegos (normal hasta que lances uno con Proton)"
+                MANUAL_STEPS+=("Lanza un juego de Windows con Proton una vez para que Protontricks lo liste.")
+            fi
+        else
+            _chk WARN "Steam: instalado, pero Protontricks no está disponible para comprobarlo"
+        fi
+    else
+        _chk NA "Steam: no está instalado (steam-installer)"
+    fi
+
+    # --- MangoHud / MangoJuice ---
+    if command -v mangohud &>/dev/null; then
+        version="$(mangohud --version 2>/dev/null)"
+        version="${version%%$'\n'*}"
+        if mangohud_has_nvml; then
+            _chk OK "MangoHud: ${version:-instalado} (con soporte NVML)"
+        else
+            _chk WARN "MangoHud: ${version:-instalado}, pero no se detecta soporte NVML (faltarían métricas de GPU NVIDIA)"
+            MANUAL_STEPS+=("Vuelve a ejecutar este script para recompilar MangoHud con NVML (paso 5).")
+        fi
+    else
+        _chk NA "MangoHud: no está instalado (paso 5)"
+    fi
+
+    case "$MANGOJUICE_STATE" in
+        instalado)         _chk OK "MangoJuice: instalado (Flatpak, opcional)" ;;
+        rechazado)         _chk OK "MangoJuice: no instalado (opcional; MangoHud funciona igual)" ;;
+        fallo_instalacion) _chk NA "MangoJuice: no se pudo instalar (opcional; MangoHud funciona igual)" ;;
+        fallo_consulta)    _chk NA "MangoJuice: no se pudo consultar en Flathub (opcional)" ;;
+        sin_flatpak)       _chk NA "MangoJuice: Flatpak no está disponible (opcional)" ;;
+        *)                 _chk OK "MangoJuice: no se ofreció en esta ejecución (opcional)" ;;
+    esac
+
+    # --- GameMode / perfiles de energía ---
+    if pkg_installed gamemode && command -v gamemoderun &>/dev/null; then
+        _chk OK "GameMode: instalado (gamemoderun)"
+    else
+        _chk NA "GameMode: no está instalado (paso 5)"
+    fi
+
+    local gm_ini="$HOME/.config/gamemode.ini"
+    if [[ -f "$gm_ini" ]]; then
+        if grep -qF "# gamemode.ini -- configurado por setup-gaming-debian-sid.sh" "$gm_ini"; then
+            _chk OK "gamemode.ini: creado por el script (${gm_ini})"
+        else
+            _chk OK "gamemode.ini: ya existía y no lleva la marca del script; se respeta tal cual"
+        fi
+    else
+        _chk WARN "gamemode.ini: no existe (${gm_ini}); vuelve a ejecutar el script para crearlo"
+    fi
+
+    if pkg_installed power-profiles-daemon; then
+        if systemctl is-active --quiet power-profiles-daemon; then
+            local ppd_profiles
+            ppd_profiles="$(powerprofilesctl list 2>/dev/null)"
+            if grep -q 'performance:' <<<"$ppd_profiles"; then
+                _chk OK "power-profiles-daemon: activo, con el perfil 'performance' disponible"
+            else
+                _chk WARN "power-profiles-daemon: activo, pero no ofrece el perfil 'performance' (depende del hardware); game-performance funcionará sin cambiarlo"
+            fi
+        else
+            _chk WARN "power-profiles-daemon: instalado pero no activo (sudo systemctl enable --now power-profiles-daemon)"
+        fi
+    else
+        _chk NA "power-profiles-daemon: no está instalado (opcional; game-performance funciona sin él)"
+    fi
+
+    if command -v game-performance &>/dev/null; then
+        _chk OK "game-performance: wrapper instalado ($(command -v game-performance))"
+    else
+        _chk NA "game-performance: wrapper no instalado (paso 12)"
+    fi
+
+    # --- ntsync ---
+    if [[ -e /dev/ntsync ]]; then
+        local loaded_mods
+        loaded_mods="$(lsmod 2>/dev/null)"
+        if grep -q '^ntsync' <<<"$loaded_mods"; then
+            if [[ -f /etc/modules-load.d/ntsync.conf ]] && grep -qx 'ntsync' /etc/modules-load.d/ntsync.conf; then
+                _chk OK "ntsync: activo y configurado para cargarse en cada arranque"
+            else
+                _chk WARN "ntsync: cargado, pero sin persistencia (no se cargaría solo tras reiniciar); vuelve a ejecutar el script"
+            fi
+        else
+            _chk OK "ntsync: activo (integrado en el kernel)"
+        fi
+    else
+        _chk NA "ntsync: /dev/ntsync no existe (¿el kernel no incluye el módulo?)"
+    fi
+
+    echo
+    if [[ "$CHK_WARN" -eq 0 && "$CHK_NA" -eq 0 ]]; then
+        log_ok "Componentes: ${CHK_OK} OK, sin advertencias"
+    else
+        log_warn "Componentes: ${CHK_OK} OK, ${CHK_WARN} advertencia(s) (acción manual) y ${CHK_NA} no disponible(s)"
+    fi
+
+    if [[ ${#MANUAL_STEPS[@]} -gt 0 ]]; then
+        echo
+        log_info "Pasos manuales pendientes:"
+        local step
+        for step in "${MANUAL_STEPS[@]}"; do
+            echo "      · ${step}"
+        done
+    fi
+}
+
+# ---------------------------------------------------------------------------
 # Resumen final
 # ---------------------------------------------------------------------------
 step_summary() {
     log_step "Resumen"
     echo "Instalación/configuración de gaming completa."
     echo "Recomendaciones:"
+    echo "  - Steam se instaló con 'steam-installer' del repositorio oficial de Debian"
+    echo "    (contrib): se actualiza con 'sudo apt upgrade'. El cliente de Steam y los"
+    echo "    juegos se actualizan solos desde Valve, como con cualquier otra vía."
     echo "  - Heroic Games Launcher se descarga e instala/actualiza automáticamente"
-    echo "    desde el último .deb publicado en GitHub cada vez que corrés este script."
-    echo "  - ProtonPlus y MangoJuice quedaron instalados vía Flatpak, se actualizan con"
-    echo "    'flatpak update' (o desde tu centro de software)."
+    echo "    desde el último .deb publicado en GitHub cada vez que ejecutas este script."
+    echo "  - ProtonPlus quedó instalado vía Flatpak: se actualiza con 'flatpak update'"
+    echo "    (o desde tu centro de software)."
+    if flatpak_installed io.github.radiolamp.mangojuice; then
+        echo "  - MangoJuice está instalado (Flatpak) para configurar MangoHud gráficamente."
+    fi
     echo "  - MangoHud se compiló desde fuente con soporte NVML (necesario para ver"
     echo "    % de uso, VRAM y temperatura de GPUs NVIDIA); el paquete de apt no lo trae."
-    echo "    Si 'apt upgrade' llegara a reinstalar el paquete 'mangohud' y pisar el"
-    echo "    binario compilado, volvé a correr este script para recompilarlo."
-    echo "  - En Steam: Configuración → Compatibilidad → activá 'Habilitar Steam Play"
-    echo "    para todos los demás títulos' y elegí la versión de Proton (o una de"
+    echo "    Si 'apt upgrade' (o instalar algún paquete que dependa de 'mangohud')"
+    echo "    llegara a reinstalar el paquete de apt y pisar el binario compilado,"
+    echo "    vuelve a ejecutar este script para recompilarlo."
+    echo "  - Winetricks y Protontricks quedaron instalados como paquetes nativos de"
+    echo "    Debian (se actualizan solos con 'apt upgrade'). Úsalos así:"
+    echo "      protontricks -s <nombre del juego>   # buscar el AppID"
+    echo "      protontricks <AppID> <acción>         # ej.: vcrun2019, corefonts"
+    echo "  - En Steam: Configuración → Compatibilidad → activa 'Habilitar Steam Play"
+    echo "    para todos los demás títulos' y elige la versión de Proton (o una de"
     echo "    ProtonPlus) que quieras usar por defecto."
-    echo "  - Empezá cada juego SIN game-performance, solo con:"
+    echo "  - Empieza cada juego SIN game-performance, solo con:"
     echo "      gamemoderun mangohud %command%"
-    echo "    y mirá el overlay de MangoHud (% de uso y temperatura de CPU/GPU)."
-    echo "    Si los FPS te alcanzan y no ves stuttering, dejalo así -- forzar más"
+    echo "    y mira el overlay de MangoHud (% de uso y temperatura de CPU/GPU)."
+    echo "    Si los FPS te alcanzan y no ves stuttering, déjalo así -- forzar más"
     echo "    no te da nada a cambio, solo calor y ruido de ventilador de más."
-    echo "    Si notás FPS bajos o caídas puntuales, sumá game-performance:"
+    echo "    Si notas FPS bajos o caídas puntuales, suma game-performance:"
     echo "      game-performance gamemoderun mangohud %command%"
     echo "    game-performance cambia el perfil de energía a 'performance' mientras"
     echo "    el juego corre (en este equipo eso sincroniza a la vez gobernador de"
@@ -972,13 +1608,13 @@ step_summary() {
     echo "    práctica) y restaura el perfil anterior al cerrar el juego."
     echo "    Esto es por-juego, no una regla fija: en este mismo equipo se midió"
     echo "    un caso con los mismos FPS pero 27°C más de CPU al forzarlo, así que"
-    echo "    no asumas que 'más forzado' es siempre mejor -- medí con MangoHud."
-    echo "    Fuera de Steam (terminal, Heroic, Lutris) podés usar game-performance"
+    echo "    no asumas que 'más forzado' es siempre mejor -- mide con MangoHud."
+    echo "    Fuera de Steam (terminal, Heroic, Lutris) puedes usar game-performance"
     echo "    igual: 'game-performance <comando>'."
-    echo "  - Si tenés GPU NVIDIA dedicada, el script ya configuró 'pci_dev' en"
+    echo "  - Si tienes GPU NVIDIA dedicada, el script ya configuró 'pci_dev' en"
     echo "    ~/.config/MangoHud/MangoHud.conf con el bus-id detectado vía nvidia-smi."
     echo "    En equipos con GPU híbrida, si MangoJuice agrega 'gpu_list=' puede pisar"
-    echo "    ese filtrado y volver a mostrar el % de GPU equivocado: comentá o borrá"
+    echo "    ese filtrado y volver a mostrar el % de GPU equivocado: comenta o borra"
     echo "    esa línea si eso pasa."
     echo "  - ~/.config/gamemode.ini quedó creado (solo si no existía ya) con"
     echo "    desiredgov detectado automáticamente según tu driver cpufreq (schedutil"
@@ -986,12 +1622,22 @@ step_summary() {
     echo "    modo activo, powersave YA es dinámico, no es el modo fijo-bajo de antes)."
     echo "    Así el CPU sube/baja de frecuencia según la carga real, en vez de"
     echo "    quedarse arriba fijo todo el tiempo que el juego está abierto. Si ya lo"
-    echo "    tenías configurado a tu manera, el script no lo tocó. Corré"
+    echo "    tenías configurado a tu manera, el script no lo tocó. Ejecuta"
     echo "    'gamemoded -t' para confirmar qué gobernador detectó y aplicó."
     echo "  - mesa-utils quedó instalado (glxgears, glxinfo) solo como herramienta de"
     echo "    diagnóstico rápido, para probar drivers/MangoHud sin abrir un juego."
-    echo "  - Si acabás de habilitar ntsync, puede que necesites reiniciar para que"
-    echo "    quede persistente en el próximo arranque."
+    if pkg_installed lutris; then
+        echo "  - Lutris está instalado (paquete de apt, se actualiza con 'sudo apt upgrade')."
+    fi
+    if pkg_installed gamescope; then
+        echo "  - Gamescope está instalado. Uso en Steam (opciones de lanzamiento):"
+        echo "      gamescope -f -- %command%"
+    fi
+    echo "  - ntsync: el script lo carga y lo deja configurado para cada arranque"
+    echo "    (/etc/modules-load.d/ntsync.conf). Tras reiniciar, comprueba que sigue activo:"
+    echo "      ls -l /dev/ntsync"
+    echo "    Solo lo aprovechan versiones de Wine/Proton con soporte ntsync; con un"
+    echo "    juego abierto, 'sudo lsof /dev/ntsync' muestra si lo está usando."
 }
 
 # ---------------------------------------------------------------------------
@@ -1002,19 +1648,26 @@ main() {
     check_system_prerequisites
 
     log_info "Actualizando índices de apt (necesario para que los pasos siguientes detecten actualizaciones reales, no solo instalaciones nuevas)"
-    sudo apt update
+    if ! sudo apt update; then
+        log_warn "'apt update' terminó con errores (puede ser un repositorio concreto o la red). Seguir con índices posiblemente desactualizados no es lo ideal."
+        _confirm_or_exit
+    fi
 
     step_steam
     step_ensure_flatpak
     step_protonplus
     step_heroic_launcher
     step_gamemode_mangohud
+    step_winetricks_protontricks
     step_gamemode_ini_defaults
     step_mangohud_pci_dev
     step_diagnostic_tools
     step_max_map_count
     step_ntsync
     step_install_game_performance
+    step_lutris
+    step_gamescope
+    step_final_checks
     step_summary
 }
 
