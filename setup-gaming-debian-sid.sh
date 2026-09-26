@@ -879,38 +879,6 @@ _ensure_wineserver_in_path() {
 # paquetes. Si en Sid hay un conflicto temporal de dependencias (por ejemplo
 # con libsnappy1v5) se informa y se continúa, sin downgrades ni mezclar
 # paquetes de otras versiones.
-_try_install_wine32() {
-    if pkg_installed wine32:i386; then
-        log_ok "wine32:i386 ya está instalado"
-        return 0
-    fi
-
-    if ! apt-cache show wine32:i386 &>/dev/null; then
-        log_info "wine32:i386 no está disponible en tus repositorios; no es imprescindible (Wine ya ejecuta apps de 32 bits)."
-        return 0
-    fi
-
-    local sim rc
-    sim="$(LC_ALL=C apt-get -s install wine32:i386 2>&1)"
-    rc=$?
-
-    if [[ "$rc" -ne 0 ]]; then
-        log_warn "wine32:i386 no se puede instalar ahora mismo (probable conflicto temporal de dependencias en Sid). Se continúa sin él; no es imprescindible."
-        grep -E '^E:|Depends:|Conflicts:|unmet dependencies' <<<"$sim" | head -4 | sed 's/^/      · /'
-        return 0
-    fi
-
-    if grep -q '^Remv' <<<"$sim"; then
-        log_warn "Instalar wine32:i386 eliminaría paquetes ya instalados; no se instala. Se continúa sin él."
-        return 0
-    fi
-
-    if sudo apt install -y wine32:i386; then
-        log_ok "wine32:i386 instalado"
-    else
-        log_warn "Falló la instalación de wine32:i386. Se continúa sin él; no es imprescindible."
-    fi
-}
 
 step_winetricks_protontricks() {
     log_step "6/14 · Instalando Winetricks y Protontricks"
@@ -923,7 +891,6 @@ step_winetricks_protontricks() {
     if sudo apt install -y winetricks protontricks; then
         log_ok "Winetricks y Protontricks instalados/actualizados"
         _ensure_wineserver_in_path
-        _try_install_wine32
     else
         log_err "Falló la instalación de Winetricks/Protontricks. Se omite; el resto del script continúa."
     fi
