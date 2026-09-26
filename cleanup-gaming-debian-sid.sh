@@ -13,10 +13,9 @@
 #   ./cleanup-gaming-debian-sid.sh --purge-data   # además ofrece borrar datos
 #
 # Qué SÍ elimina (cada bloque pide confirmación):
-#   1. Paquetes de apt: steam-installer, heroic, gamemode, winetricks,
-#      protontricks, mesa-utils, lutris y gamescope. Se purgan sin pantallas
-#      de debconf. steam-launcher no se elimina: el setup actual lo respeta
-#      si ya estaba instalado.
+#   1. Paquetes de apt: steam-installer, steam-launcher, heroic, gamemode,
+#      winetricks, protontricks, mesa-utils, lutris y gamescope. Se purgan
+#      sin pantallas de debconf.
 #   2. Flatpak: ProtonPlus, MangoJuice y GOverlay (este último, de versiones
 #      anteriores del setup que lo instalaban), si están instalados.
 #   3. MangoHud compilado (instalado con "ninja install", que dpkg no
@@ -44,7 +43,7 @@
 #
 # =============================================================================
 
-VERSION="1.0.0"
+VERSION="1.0.1"
 
 set -uo pipefail
 
@@ -169,9 +168,9 @@ check_user() {
 # 1. Paquetes de apt
 # ---------------------------------------------------------------------------
 step_packages() {
-    log_step "1/7 · Paquetes de apt"
+    log_step "1/8 · Paquetes de apt"
 
-    local candidates=(steam-installer heroic gamemode winetricks protontricks mesa-utils lutris gamescope)
+    local candidates=(steam-installer steam-launcher heroic gamemode winetricks protontricks mesa-utils lutris gamescope)
     local found=() pkg
     for pkg in "${candidates[@]}"; do
         pkg_present "$pkg" && found+=("$pkg")
@@ -518,7 +517,65 @@ step_deb_src() {
 }
 
 # ---------------------------------------------------------------------------
-# 7. Datos de usuario (solo con --purge-data)
+# 7. Lanzadores de Steam del usuario
+# ---------------------------------------------------------------------------
+step_steam_desktop() {
+    log_step "7/8 · Lanzadores de Steam"
+
+    local desktop_dir="${HOME}/.local/share/applications"
+    local candidates=(
+        "${desktop_dir}/steam.desktop"
+        "${desktop_dir}/steam-native.desktop"
+        "${desktop_dir}/steam-url-handler.desktop"
+        "${desktop_dir}/steam-launcher.desktop"
+    )
+    local found=() file
+
+    for file in "${candidates[@]}"; do
+        [[ -f "$file" ]] && found+=("$file")
+    done
+
+    if [[ ${#found[@]} -eq 0 ]]; then
+        log_ok "No quedan lanzadores de Steam en ${desktop_dir}"
+        return 0
+    fi
+
+    log_info "Se han encontrado estos lanzadores:"
+    printf '      · %s\n' "${found[@]}"
+
+    if ! confirm "¿Eliminar estos lanzadores de Steam?"; then
+        log_info "Se omite este bloque"
+        return 0
+    fi
+
+    if [[ "$DRY_RUN" -eq 1 ]]; then
+        printf '  [simulación] rm -f %s\n' "${found[@]}"
+        return 0
+    fi
+
+    local failed=0
+    for file in "${found[@]}"; do
+        if rm -f -- "$file"; then
+            log_ok "Eliminado: $file"
+        else
+            log_err "No se pudo eliminar: $file"
+            failed=1
+        fi
+    done
+
+    if [[ "$failed" -eq 0 ]]; then
+        if command -v update-desktop-database >/dev/null 2>&1; then
+            update-desktop-database "$desktop_dir" >/dev/null 2>&1 || true
+        fi
+        log_ok "Lanzadores de Steam eliminados"
+    else
+        FAILURES+=("limpieza de lanzadores de Steam")
+        return 1
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# 8. Datos de usuario (solo con --purge-data)
 # ---------------------------------------------------------------------------
 #
 # Aquí viven las bibliotecas de juegos, los prefijos de Proton y, a veces,
@@ -526,7 +583,7 @@ step_deb_src() {
 # irreversible: por eso solo se ofrece con --purge-data, se muestra antes lo
 # que ocupa cada carpeta y hay que escribir BORRAR. -y no lo acepta.
 step_user_data() {
-    log_step "7/7 · Datos de usuario"
+    log_step "8/8 · Datos de usuario"
 
     local paths=(
         "${HOME}/.steam"
@@ -648,6 +705,7 @@ main() {
     step_config_files
     step_wineserver_link
     step_deb_src
+    step_steam_desktop
     step_user_data
     step_summary
 }
