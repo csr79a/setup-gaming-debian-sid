@@ -1384,7 +1384,16 @@ step_final_checks() {
         _chk NA "Wine: no responde ('wine --version'); Winetricks debería haberlo instalado"
     fi
 
-    if command -v wineserver &>/dev/null && version="$(wineserver --version 2>/dev/null)" && [[ -n "$version" ]]; then
+    wineserver_link="/usr/local/bin/wineserver"
+
+    if [[ -L "$wineserver_link" && -x "$wineserver_link" ]]; then
+        version="$("$wineserver_link" --version 2>/dev/null || true)"
+        if [[ -n "$version" ]]; then
+            _chk OK "wineserver: ${version} (${wineserver_link})"
+        else
+            _chk WARN "wineserver: el enlace ${wineserver_link} existe pero no responde."
+        fi
+    elif command -v wineserver &>/dev/null && version="$(wineserver --version 2>/dev/null)" && [[ -n "$version" ]]; then
         _chk OK "wineserver: ${version} ($(command -v wineserver))"
     else
         _chk NA "wineserver: no está en el PATH; Winetricks fallaría con 'wineserver not found!'"
