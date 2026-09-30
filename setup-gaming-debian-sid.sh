@@ -393,6 +393,14 @@ step_protonplus() {
 step_heroic_launcher() {
     log_step "4/14 · Descargando e instalando/actualizando Heroic Games Launcher"
 
+    if ! command -v curl &>/dev/null; then
+        log_info "curl no está instalado; se instala para descargar Heroic desde GitHub"
+        if ! sudo apt install -y curl; then
+            log_err "No se pudo instalar curl. Se omite este paso."
+            return 1
+        fi
+    fi
+
     local api_url="https://api.github.com/repos/Heroic-Games-Launcher/HeroicGamesLauncher/releases/latest"
     local deb_url
     deb_url="$(curl -fsSL "$api_url" | grep -oP '"browser_download_url":\s*"\K[^"]*amd64\.deb(?=")' | head -n1)"
@@ -873,7 +881,8 @@ step_winetricks_protontricks() {
 
     local sources_file="/etc/apt/sources.list.d/debian.sources"
     if [[ -f "$sources_file" ]] && ! grep -qE '^Components:.*\bcontrib\b' "$sources_file"; then
-        log_warn "No se detectó el componente 'contrib' habilitado en ${sources_file}. Winetricks y Protontricks viven en 'contrib'; si la instalación de abajo falla, ese es probablemente el motivo -- agrega 'contrib' a la línea 'Components:' y ejecuta 'sudo apt update'."
+        log_err "No se detectó el componente 'contrib' habilitado en $sources_file. Winetricks y Protontricks viven en 'contrib'. Habilita 'contrib', ejecuta 'sudo apt update' y vuelve a ejecutar este script."
+        return 1
     fi
 
     if sudo apt install -y winetricks protontricks; then
@@ -1047,13 +1056,27 @@ step_max_map_count() {
     log_step "10/14 · Ajustando vm.max_map_count"
 
     local sysctl_file="/etc/sysctl.d/80-gamecompatibility.conf"
-    if [[ -f "$sysctl_file" ]] && grep -q '^vm.max_map_count=2147483642' "$sysctl_file"; then
-        log_ok "vm.max_map_count ya estaba configurado"
+    local sysctl_marker="# vm.max_map_count -- configurado por setup-gaming-debian-sid.sh"
+
+    if [[ -f "$sysctl_file" ]]; then
+        if grep -qF "$sysctl_marker" "$sysctl_file" && grep -qE '^vm\.max_map_count=2147483642$' "$sysctl_file"; then
+            log_ok "vm.max_map_count ya estaba configurado"
+        elif grep -qF "$sysctl_marker" "$sysctl_file"; then
+            log_warn "$sysctl_file lleva la marca del script pero no contiene el valor esperado; no se sobrescribe."
+            return 0
+        else
+            log_warn "$sysctl_file ya existe y no lleva la marca del script; no se sobrescribe para evitar modificar configuración ajena."
+            return 0
+        fi
     else
-        echo "vm.max_map_count=2147483642" | sudo tee "$sysctl_file" >/dev/null
-        sudo sysctl --system >/dev/null
-        log_ok "vm.max_map_count=2147483642 aplicado (${sysctl_file})"
+        {
+            echo "$sysctl_marker"
+            echo "vm.max_map_count=2147483642"
+        } | sudo tee "$sysctl_file" >/dev/null
     fi
+
+    sudo sysctl --system >/dev/null
+    log_ok "vm.max_map_count=2147483642 aplicado ($sysctl_file)"
 }
 
 # ---------------------------------------------------------------------------
