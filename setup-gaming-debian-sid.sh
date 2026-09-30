@@ -737,7 +737,7 @@ step_mangohud_compile_nvml() {
         installed_now_base="$(_mangohud_version_base "$installed_now")"
         tag_base_final="$(_mangohud_version_base "${MANGOHUD_TAG:-}")"
         if [[ -n "$tag_base_final" && "$installed_now_base" != "$tag_base_final" ]]; then
-            log_warn "MangoHud compilado con NVML, pero 'mangohud --version' reporta '${installed_now}' en vez de '${MANGOHUD_TAG}'. La comparación de versiones de este script podría no funcionar como se espera (recompilaría en cada ejecución); revisa el formato de 'mangohud --version' a mano."
+            log_warn "MangoHud compilado con NVML, pero 'mangohud --version' reporta '${installed_now}' en vez de '${MANGOHUD_TAG}'. La comparación de versiones podría no coincidir con el formato reportado por esa versión de MangoHud; revisa el formato de 'mangohud --version' si vuelve a compilarse en cada ejecución."
         else
             log_ok "MangoHud compilado e instalado con soporte NVML (${installed_now:-$MANGOHUD_TAG})"
         fi
