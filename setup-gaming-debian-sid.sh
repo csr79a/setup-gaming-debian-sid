@@ -861,7 +861,7 @@ _ensure_wineserver_in_path() {
     fi
     hash -r
 
-    if version="$(wineserver --version 2>/dev/null)" && [[ -n "$version" ]]; then
+    if version="$(wineserver --version 2>&1)" && [[ -n "$version" ]]; then
         log_ok "wineserver disponible (${version})"
     else
         log_err "El enlace ${link} se creó pero 'wineserver --version' no responde. Comprueba que /usr/local/bin está en tu PATH."
@@ -1387,7 +1387,7 @@ step_final_checks() {
     wineserver_link="/usr/local/bin/wineserver"
 
     if [[ -L "$wineserver_link" && -x "$wineserver_link" ]]; then
-        version="$("$wineserver_link" --version 2>/dev/null || true)"
+        version="$("$wineserver_link" --version 2>&1 || true)"
         if [[ -n "$version" ]]; then
             _chk OK "wineserver: ${version} (${wineserver_link})"
         else
