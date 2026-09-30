@@ -31,7 +31,7 @@
 #   chmod +x setup-gaming-debian-sid.sh
 #   ./setup-gaming-debian-sid.sh
 #
-# Complementario a setup-debian-sid.sh. Repite ejecución: el script es
+# Es complementario a setup-debian-sid.sh. Repite ejecución: el script es
 # idempotente.
 
 set -uo pipefail
@@ -597,17 +597,11 @@ step_mangohud_compile_nvml() {
     # entorno), así que además de reinstalar el paquete, la llamada a
     # meson de abajo fuerza un PKG_CONFIG_PATH estándar de Debian.
     #
-    # wayland-protocols / libgbm-dev: tampoco están cubiertos por 'apt
-    # build-dep mangohud', por el mismo motivo -- ese build-dep refleja
-    # las dependencias del paquete VIEJO de Debian, mientras que 'git
-    # clone' de abajo trae la rama por defecto de upstream (sin fijar
-    # tag/versión). La reescritura de upstream ("MangoHud next") fue
-    # agregando dependencias nuevas de a una: primero wayland-protocols
-    # (backend Wayland), después gbm/libgbm-dev (backend de render). Como
-    # el script no fija una versión del repo, esto puede volver a pasar
-    # con otra dependencia nueva que upstream agregue en el futuro -- si
-    # eso ocurre, agregar el paquete que pida meson en el error a esta
-    # lista es la solución (mismo patrón cada vez).
+    # wayland-protocols / libgbm-dev: se instalan explícitamente porque las
+    # dependencias de build-dep corresponden al paquete Debian disponible y
+    # pueden no cubrir todos los requisitos del tag de MangoHud que se compila.
+    # El repositorio se clona fijando MANGOHUD_TAG, por lo que el conjunto de
+    # dependencias esperado queda asociado a una versión concreta.
     if ! sudo apt install -y libcap-dev libyaml-cpp-dev libwayland-egl-backend-dev wayland-protocols libgbm-dev; then
         log_err "No se pudieron instalar las dependencias de compilación (libcap-dev/libyaml-cpp-dev/libwayland-egl-backend-dev/wayland-protocols/libgbm-dev). Se aborta la compilación de MangoHud; el resto del script continúa."
         return 1
@@ -640,17 +634,11 @@ step_mangohud_compile_nvml() {
     }
 
     # Resuelve automáticamente dependencias de meson que falten, del tipo
-    # 'Dependency "X" not found'. Esto pasa seguido porque 'git clone' de
-    # arriba trae la rama por defecto de upstream SIN fijar tag/versión,
-    # y la reescritura de upstream ("MangoHud next") fue agregando
-    # requisitos nuevos de a uno (ya se vio en la práctica con
-    # wayland-protocols, gbm y egl). En vez de mantener a mano una lista
-    # fija de paquetes en el script (que se desactualiza cada vez que
-    # upstream suma un requisito), esta función usa apt-file para
-    # averiguar qué paquete Debian provee el archivo <dependencia>.pc y
-    # lo instala. apt-file update solo se corre una vez por ejecución del
-    # script (variable de control en el enclosing scope), no en cada
-    # reintento.
+    # 'Dependency "X" not found'. Aunque MANGOHUD_TAG fija una versión,
+    # el conjunto de dependencias de compilación puede diferir del paquete
+    # Debian disponible. En vez de mantener una lista fija de paquetes,
+    # esta función usa apt-file para localizar el paquete Debian que provee
+    # el archivo <dependencia>.pc y lo instala.
     local apt_file_updated=0
     local tried_pkgs=""
     _mangohud_resolve_missing_meson_deps() {
