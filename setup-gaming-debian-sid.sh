@@ -1393,7 +1393,7 @@ step_final_checks() {
         else
             _chk WARN "wineserver: el enlace ${wineserver_link} existe pero no responde."
         fi
-    elif command -v wineserver &>/dev/null && version="$(wineserver --version 2>/dev/null)" && [[ -n "$version" ]]; then
+    elif command -v wineserver &>/dev/null && version="$(wineserver --version 2>&1)" && [[ -n "$version" ]]; then
         _chk OK "wineserver: ${version} ($(command -v wineserver))"
     else
         _chk NA "wineserver: no está en el PATH; Winetricks fallaría con 'wineserver not found!'"
