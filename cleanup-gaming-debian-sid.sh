@@ -217,7 +217,7 @@ step_packages() {
 # 2. Flatpak (ProtonPlus, MangoJuice y GOverlay heredado)
 # ---------------------------------------------------------------------------
 step_flatpak() {
-    log_step "2/7 · Flatpak (ProtonPlus, MangoJuice y GOverlay)"
+    log_step "2/8 · Flatpak (ProtonPlus, MangoJuice y GOverlay)"
 
     if ! command -v flatpak &>/dev/null; then
         log_ok "Flatpak no está instalado; no hay nada que quitar"
@@ -271,7 +271,7 @@ step_flatpak() {
 # las rutas conocidas, y solo si NO pertenecen a ningún paquete de Debian (si
 # algún día instalas el mangohud de Debian, sus ficheros no se tocan).
 step_mangohud() {
-    log_step "3/7 · MangoHud compilado desde fuente"
+    log_step "3/8 · MangoHud compilado desde fuente"
 
     local candidates=(
         /usr/bin/mangohud
@@ -336,7 +336,7 @@ step_mangohud() {
 # Cada fichero solo se borra si lleva la marca (o el contenido exacto) que
 # escribe setup-gaming-debian-sid.sh. Si lo has modificado a mano, no se toca.
 step_config_files() {
-    log_step "4/7 · Ficheros de configuración del script"
+    log_step "4/8 · Ficheros de configuración del script"
 
     local wrapper="/usr/local/bin/game-performance"
     local wrapper_marker="# game-performance v2 -- instalado por setup-gaming-debian-sid.sh"
@@ -442,7 +442,7 @@ step_config_files() {
 # es un symlink que apunta exactamente a un wineserver perteneciente a
 # libwine/wine64 instalado.
 step_wineserver_link() {
-    log_step "5/7 · Enlace de compatibilidad wineserver"
+    log_step "5/8 · Enlace de compatibilidad wineserver"
 
     local link="/usr/local/bin/wineserver"
 
@@ -497,7 +497,7 @@ step_wineserver_link() {
 # 6. deb-src activado para compilar MangoHud (opcional)
 # ---------------------------------------------------------------------------
 step_deb_src() {
-    log_step "6/7 · deb-src en debian.sources (opcional)"
+    log_step "6/8 · deb-src en debian.sources (opcional)"
 
     local sources_file="/etc/apt/sources.list.d/debian.sources"
     if [[ ! -f "$sources_file" ]] || ! grep -qE '^Types: deb deb-src$' "$sources_file"; then
